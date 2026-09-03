@@ -13,7 +13,7 @@ The Node process boots `server/plugins/paper-worker.ts`, which runs `startPaperW
 3. If armed, Kelly paper fills with Quant caps
 4. Persist to `${ISOBAR_DATA_DIR}/paper-book.json`
 
-The desk UI polls `getPaperBookFn` ~every 10s. Closing the browser does **not** stop the bot.
+The desk UI polls `getPaperBookFn` on a short interval (see `usePaperBookQuery` in `desk-app.tsx`). Closing the browser does **not** stop the bot.
 
 ## Env
 
