@@ -3,11 +3,13 @@ import { loadWeatherEvents } from "./polymarket";
 import { loadWeather } from "./weather";
 import { bucketProbability, impliedTemp, kellyFraction, mean } from "./math";
 import { PAPER_MAX_PRICE, PAPER_MIN_EDGE, PAPER_MIN_PRICE } from "./paper-book";
+import { ensembleOk } from "./ensemble";
 import type { DeskEvent, DeskSnapshot, MarketBucket, Signal, WeatherNow } from "./types";
 
 const MIN_TRADE_PRICE = PAPER_MIN_PRICE;
 const MAX_TRADE_PRICE = PAPER_MAX_PRICE;
 const MIN_EDGE = PAPER_MIN_EDGE;
+const MAX_SPREAD = 0.15;
 
 export async function buildDeskSnapshot(): Promise<DeskSnapshot> {
   let events: Awaited<ReturnType<typeof loadWeatherEvents>> = [];
@@ -36,20 +38,23 @@ export async function buildDeskSnapshot(): Promise<DeskSnapshot> {
   for (const ev of events) {
     const wx = weather[ev.city.id];
     const members = membersForEvent(wx, ev.eventDate);
+    const enough = ensembleOk(members);
     const isLiveDay = wx?.localDate === ev.eventDate;
     const observedC = isLiveDay ? (wx?.observedMaxC ?? null) : null;
     const buckets: MarketBucket[] = ev.markets.map((m) => {
-      const modelPRaw = members.length
+      // Empty / thin ensemble must NOT price modelP=0 (that mints fake NO edges).
+      const modelPRaw = enough
         ? bucketProbability(members, m.bound.lo, m.bound.hi, ev.unit, ev.eventDate, observedC)
         : 0;
       let modelP = modelPRaw;
-      if (observedC != null && Number.isFinite(m.bound.hi)) {
+      if (enough && observedC != null && Number.isFinite(m.bound.hi)) {
         const obsU = convertTemp(observedC, ev.unit);
         if (m.bound.hi <= obsU + 1e-6) modelP = 0;
       }
-      const edgeYes = modelP - m.yesPrice;
-      const edgeNo = 1 - modelP - m.noPrice;
+      const edgeYes = enough ? modelP - m.yesPrice : 0;
+      const edgeNo = enough ? 1 - modelP - m.noPrice : 0;
       const tradeable =
+        enough &&
         m.yesPrice >= MIN_TRADE_PRICE &&
         m.yesPrice <= MAX_TRADE_PRICE &&
         (Math.abs(edgeYes) >= MIN_EDGE || Math.abs(edgeNo) >= MIN_EDGE);
@@ -74,14 +79,23 @@ export async function buildDeskSnapshot(): Promise<DeskSnapshot> {
         modelP,
         edgeYes,
         edgeNo,
-        kellyYes: kellyFraction(modelP, m.yesPrice),
-        kellyNo: kellyFraction(1 - modelP, m.noPrice),
+        kellyYes: enough ? kellyFraction(modelP, m.yesPrice) : 0,
+        kellyNo: enough ? kellyFraction(1 - modelP, m.noPrice) : 0,
         tradeable,
       };
     });
 
-    const modelHigh = members.length ? convertTemp(mean(members), ev.unit) : wx?.modelMeanC != null ? convertTemp(wx.modelMeanC, ev.unit) : null;
-    const observed = observedC != null ? convertTemp(observedC, ev.unit) : wx?.tempC != null ? convertTemp(wx.tempC, ev.unit) : null;
+    const modelHigh = enough
+      ? convertTemp(mean(members), ev.unit)
+      : wx?.modelMeanC != null
+        ? convertTemp(wx.modelMeanC, ev.unit)
+        : null;
+    const observed =
+      observedC != null
+        ? convertTemp(observedC, ev.unit)
+        : wx?.tempC != null
+          ? convertTemp(wx.tempC, ev.unit)
+          : null;
     const implied = impliedTemp(buckets);
 
     const event: DeskEvent = {
@@ -106,50 +120,69 @@ export async function buildDeskSnapshot(): Promise<DeskSnapshot> {
       bestSignal: null,
     };
 
-    for (const b of buckets) {
-      const candidates: Array<Omit<Signal, "id">> = [];
-      if (b.edgeYes >= MIN_EDGE && b.yesPrice >= MIN_TRADE_PRICE && b.yesPrice <= MAX_TRADE_PRICE) {
-        candidates.push({
-          eventId: event.eventId,
-          marketId: b.marketId,
-          cityId: event.cityId,
-          cityName: event.cityName,
-          date: event.eventDate,
-          kind: event.kind,
-          unit: event.unit,
-          question: b.question,
-          label: b.label,
-          side: "YES",
-          marketP: b.yesPrice,
-          modelP: b.modelP,
-          edge: b.edgeYes,
-          kelly: b.kellyYes,
-          volume24hr: b.volume24hr || event.volume24hr,
-        });
-      }
-      if (b.edgeNo >= MIN_EDGE && b.noPrice >= MIN_TRADE_PRICE && b.noPrice <= MAX_TRADE_PRICE) {
-        candidates.push({
-          eventId: event.eventId,
-          marketId: b.marketId,
-          cityId: event.cityId,
-          cityName: event.cityName,
-          date: event.eventDate,
-          kind: event.kind,
-          unit: event.unit,
-          question: b.question,
-          label: b.label,
-          side: "NO",
-          marketP: b.noPrice,
-          modelP: 1 - b.modelP,
-          edge: b.edgeNo,
-          kelly: b.kellyNo,
-          volume24hr: b.volume24hr || event.volume24hr,
-        });
-      }
-      for (const c of candidates) {
-        const sig: Signal = { ...c, id: `${c.marketId}-${c.side}` };
-        signals.push(sig);
-        if (!event.bestSignal || sig.edge > event.bestSignal.edge) event.bestSignal = sig;
+    // Quant: no signals from thin/empty ensembles (members=[] => zero fills).
+    if (enough && !warning) {
+      for (const b of buckets) {
+        const spreadOk = b.spread == null || (Number.isFinite(b.spread) && b.spread <= MAX_SPREAD);
+        if (!spreadOk) continue;
+
+        const candidates: Array<Omit<Signal, "id">> = [];
+        if (
+          b.edgeYes >= MIN_EDGE &&
+          b.yesPrice >= MIN_TRADE_PRICE &&
+          b.yesPrice <= MAX_TRADE_PRICE &&
+          b.modelP > 0.05 &&
+          b.modelP < 0.95
+        ) {
+          candidates.push({
+            eventId: event.eventId,
+            marketId: b.marketId,
+            cityId: event.cityId,
+            cityName: event.cityName,
+            date: event.eventDate,
+            kind: event.kind,
+            unit: event.unit,
+            question: b.question,
+            label: b.label,
+            side: "YES",
+            marketP: b.yesPrice,
+            modelP: b.modelP,
+            edge: b.edgeYes,
+            kelly: b.kellyYes,
+            volume24hr: b.volume24hr || event.volume24hr,
+          });
+        }
+        const noModel = 1 - b.modelP;
+        if (
+          b.edgeNo >= MIN_EDGE &&
+          b.noPrice >= MIN_TRADE_PRICE &&
+          b.noPrice <= MAX_TRADE_PRICE &&
+          noModel > 0.05 &&
+          noModel < 0.95
+        ) {
+          candidates.push({
+            eventId: event.eventId,
+            marketId: b.marketId,
+            cityId: event.cityId,
+            cityName: event.cityName,
+            date: event.eventDate,
+            kind: event.kind,
+            unit: event.unit,
+            question: b.question,
+            label: b.label,
+            side: "NO",
+            marketP: b.noPrice,
+            modelP: noModel,
+            edge: b.edgeNo,
+            kelly: b.kellyNo,
+            volume24hr: b.volume24hr || event.volume24hr,
+          });
+        }
+        for (const c of candidates) {
+          const sig: Signal = { ...c, id: `${c.marketId}-${c.side}` };
+          signals.push(sig);
+          if (!event.bestSignal || sig.edge > event.bestSignal.edge) event.bestSignal = sig;
+        }
       }
     }
 
@@ -159,8 +192,6 @@ export async function buildDeskSnapshot(): Promise<DeskSnapshot> {
   signals.sort((a, b) => b.edge - a.edge);
   deskEvents.sort((a, b) => b.volume24hr - a.volume24hr);
 
-  // Drop heavy per-date member vectors after pricing, but keep membersC so the UI
-  // can show the real ensemble size (clearing it made "Ensemble 0 members").
   for (const w of Object.values(weather)) {
     w.membersByDate = {};
     w.hourly = w.hourly.slice(0, 24);
@@ -170,12 +201,12 @@ export async function buildDeskSnapshot(): Promise<DeskSnapshot> {
     fetchedAt: new Date().toISOString(),
     events: deskEvents,
     weather,
-    signals: signals.slice(0, 40),
+    signals: warning ? [] : signals.slice(0, 40),
     totals: {
       events: deskEvents.length,
       cities: new Set(deskEvents.map((e) => e.cityId)).size,
       volume24hr: deskEvents.reduce((a, e) => a + e.volume24hr, 0),
-      openSignals: signals.length,
+      openSignals: warning ? 0 : signals.length,
     },
     sources: [...sources],
     warning,

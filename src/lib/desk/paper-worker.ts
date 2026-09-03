@@ -94,7 +94,6 @@ export async function settleOpenFillsFromGamma(fills: PaperFill[]): Promise<Pape
 }
 
 export function getWorkerStatus() {
-  // Refresh so /health sees Arm + fills written by another Nitro chunk.
   const book = loadPaperBook({ refresh: true });
   return {
     running: Boolean(getTimer()),
@@ -122,11 +121,12 @@ export async function tickPaperWorker(): Promise<PaperBook> {
 
     const snapshot = await buildDeskSnapshot();
 
-    // Quant: never settle on 98¢ prints — Gamma closed+winner only.
     book = { ...book, fills: await settleOpenFillsFromGamma(book.fills) };
 
     let filled = 0;
-    if (book.settings.armed && !liveTradingLocked()) {
+    // Quant: skip new fills when snapshot.warning is set (missing weather / poly).
+    const canTrade = book.settings.armed && !liveTradingLocked() && !snapshot.warning;
+    if (canTrade) {
       const nextFills = [...book.fills];
       for (const sig of snapshot.signals) {
         if (sig.edge < PAPER_MIN_EDGE) continue;
@@ -153,6 +153,9 @@ export async function tickPaperWorker(): Promise<PaperBook> {
     };
     savePaperBook(book);
     if (filled > 0) console.log(`[isobar] paper worker filled ${filled} order(s)`);
+    if (snapshot.warning && book.settings.armed) {
+      console.warn("[isobar] paper worker skip fills: snapshot warning", snapshot.warning);
+    }
     return book;
   } catch (err) {
     const message = err instanceof Error ? err.message : "paper worker tick failed";
