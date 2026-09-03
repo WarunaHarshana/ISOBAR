@@ -16,8 +16,30 @@ import {
 
 const TICK_MS = 25_000;
 
-let timer: ReturnType<typeof setInterval> | null = null;
-let running = false;
+type WorkerGlobals = {
+  __isobarPaperTimer?: ReturnType<typeof setInterval> | null;
+  __isobarPaperTickRunning?: boolean;
+};
+
+function g(): WorkerGlobals {
+  return globalThis as WorkerGlobals;
+}
+
+function getTimer() {
+  return g().__isobarPaperTimer ?? null;
+}
+
+function setTimer(next: ReturnType<typeof setInterval> | null) {
+  g().__isobarPaperTimer = next;
+}
+
+function getRunning() {
+  return Boolean(g().__isobarPaperTickRunning);
+}
+
+function setRunning(next: boolean) {
+  g().__isobarPaperTickRunning = next;
+}
 
 type GammaMarket = {
   id?: string;
@@ -72,9 +94,10 @@ export async function settleOpenFillsFromGamma(fills: PaperFill[]): Promise<Pape
 }
 
 export function getWorkerStatus() {
-  const book = loadPaperBook();
+  // Refresh so /health sees Arm + fills written by another Nitro chunk.
+  const book = loadPaperBook({ refresh: true });
   return {
-    running: Boolean(timer),
+    running: Boolean(getTimer()),
     armed: book.settings.armed,
     liveLocked: liveTradingLocked(),
     lastTickAt: book.lastTickAt,
@@ -87,9 +110,9 @@ export function getWorkerStatus() {
 }
 
 export async function tickPaperWorker(): Promise<PaperBook> {
-  if (running) return loadPaperBook();
-  running = true;
-  let book = loadPaperBook();
+  if (getRunning()) return loadPaperBook({ refresh: true });
+  setRunning(true);
+  let book = loadPaperBook({ refresh: true });
   try {
     const lock = liveTradingLocked();
     if (lock && book.settings.armed) {
@@ -144,27 +167,29 @@ export async function tickPaperWorker(): Promise<PaperBook> {
     console.error("[isobar] paper worker tick failed", err);
     return book;
   } finally {
-    running = false;
+    setRunning(false);
   }
 }
 
 export function startPaperWorker() {
-  if (timer) return getWorkerStatus();
+  if (getTimer()) return getWorkerStatus();
   void tickPaperWorker();
-  timer = setInterval(() => {
+  const timer = setInterval(() => {
     void tickPaperWorker();
   }, TICK_MS);
   if (typeof timer === "object" && timer && "unref" in timer && typeof timer.unref === "function") {
     timer.unref();
   }
+  setTimer(timer);
   console.log("[isobar] paper worker started");
   return getWorkerStatus();
 }
 
 export function stopPaperWorker() {
+  const timer = getTimer();
   if (timer) {
     clearInterval(timer);
-    timer = null;
+    setTimer(null);
     console.log("[isobar] paper worker stopped");
   }
   return getWorkerStatus();

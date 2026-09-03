@@ -40,16 +40,34 @@ const defaults: BotSettings = {
   armed: false,
 };
 
+type PaperGlobals = {
+  __isobarPaperBook?: PaperBook | null;
+};
+
+function g(): PaperGlobals {
+  return globalThis as PaperGlobals;
+}
+
 function dataPath() {
   const dir = process.env.ISOBAR_DATA_DIR || "/data";
   return join(dir, "paper-book.json");
 }
 
-let book: PaperBook | null = null;
+/**
+ * Nitro can evaluate this module twice (plugin chunk vs serverFn chunk).
+ * Always share one book via globalThis so Arm / worker /health stay in sync.
+ */
+function getCachedBook(): PaperBook | null {
+  return g().__isobarPaperBook ?? null;
+}
+
+function setCachedBook(next: PaperBook | null) {
+  g().__isobarPaperBook = next;
+}
 
 /** Test helper — clear the in-memory cache between cases. */
 export function _resetPaperBookCache() {
-  book = null;
+  setCachedBook(null);
 }
 
 export function emptyBook(): PaperBook {
@@ -84,38 +102,52 @@ export function liveTradingLocked(): string | null {
   return null;
 }
 
-export function loadPaperBook(): PaperBook {
-  if (book) return book;
+function readBookFromDisk(): PaperBook | null {
   const path = dataPath();
   try {
-    if (existsSync(path)) {
-      const raw = JSON.parse(readFileSync(path, "utf8")) as Partial<PaperBook>;
-      book = {
-        ...emptyBook(),
-        ...raw,
-        settings: { ...defaults, ...(raw.settings ?? {}) },
-        fills: Array.isArray(raw.fills) ? raw.fills : [],
-      };
-      book.settings.minEdge = PAPER_MIN_EDGE;
-      book.settings.minPrice = PAPER_MIN_PRICE;
-      book.settings.maxPrice = PAPER_MAX_PRICE;
-      book.settings.kellyFraction = PAPER_KELLY;
-      book.settings.maxPosPct = PAPER_MAX_POS;
-      if (liveTradingLocked()) book.settings.armed = false;
-      return book;
-    }
+    if (!existsSync(path)) return null;
+    const raw = JSON.parse(readFileSync(path, "utf8")) as Partial<PaperBook>;
+    const book: PaperBook = {
+      ...emptyBook(),
+      ...raw,
+      settings: { ...defaults, ...(raw.settings ?? {}) },
+      fills: Array.isArray(raw.fills) ? raw.fills : [],
+    };
+    book.settings.minEdge = PAPER_MIN_EDGE;
+    book.settings.minPrice = PAPER_MIN_PRICE;
+    book.settings.maxPrice = PAPER_MAX_PRICE;
+    book.settings.kellyFraction = PAPER_KELLY;
+    book.settings.maxPosPct = PAPER_MAX_POS;
+    if (liveTradingLocked()) book.settings.armed = false;
+    return book;
   } catch (err) {
     console.error("[isobar] failed to load paper book", err);
+    return null;
   }
-  book = emptyBook();
+}
+
+export function loadPaperBook(opts?: { refresh?: boolean }): PaperBook {
+  if (!opts?.refresh) {
+    const cached = getCachedBook();
+    if (cached) return cached;
+  }
+
+  const fromDisk = readBookFromDisk();
+  if (fromDisk) {
+    setCachedBook(fromDisk);
+    return fromDisk;
+  }
+
+  const book = emptyBook();
   if (process.env.ISOBAR_PAPER_ARMED === "true" && !liveTradingLocked()) {
     book.settings.armed = true;
   }
+  setCachedBook(book);
   return book;
 }
 
 export function savePaperBook(next: PaperBook) {
-  book = next;
+  setCachedBook(next);
   const path = dataPath();
   try {
     mkdirSync(dirname(path), { recursive: true });
@@ -142,7 +174,7 @@ export function availableCash(current: PaperBook = loadPaperBook()) {
 }
 
 export function patchSettings(patch: Partial<BotSettings>) {
-  const cur = loadPaperBook();
+  const cur = loadPaperBook({ refresh: true });
   const lock = liveTradingLocked();
   if (patch.armed === true && lock) {
     const next: PaperBook = {
@@ -170,7 +202,7 @@ export function patchSettings(patch: Partial<BotSettings>) {
 }
 
 export function resetBook() {
-  const cur = loadPaperBook();
+  const cur = loadPaperBook({ refresh: true });
   const next: PaperBook = {
     ...cur,
     fills: [],
