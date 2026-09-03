@@ -139,7 +139,7 @@ describe("loadWeather ensemble date-key", () => {
     assert.ok(wx.nyc.source.includes("Open-Meteo ensemble"));
   });
 
-  it("retries per-city when the batch URL fails and logs the failure", async () => {
+  it("chunks per-city only on 400/URI-too-long, not on 5xx", async () => {
     const localDate = new Intl.DateTimeFormat("en-CA", { timeZone: nyc.tz }).format(new Date());
     const errors: unknown[] = [];
     const orig = console.error;
@@ -150,7 +150,7 @@ describe("loadWeather ensemble date-key", () => {
       stubFetch((url) => {
         if (url.includes("ensemble-api.open-meteo.com")) {
           const latParam = new URL(url).searchParams.get("latitude") ?? "";
-          if (latParam.includes(",")) return jsonResponse({ error: "batch too big" }, 500);
+          if (latParam.includes(",")) return jsonResponse({ error: "URI too long" }, 400);
           return jsonResponse(ensembleBody([localDate], [22], 8));
         }
         if (url.includes("previous-runs-api.open-meteo.com")) return jsonResponse(forecastBody());
