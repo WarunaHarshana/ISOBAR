@@ -7,6 +7,7 @@ import {
   realizedPnl,
   resetBook,
   savePaperBook,
+  truncateFills,
 } from "./paper-book";
 import { getWorkerStatus, startPaperWorker, tickPaperWorker } from "./paper-worker";
 import type { Signal } from "./types";
@@ -89,11 +90,9 @@ export const manualPaperTradeFn = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     startPaperWorker();
     const book = loadPaperBook();
-    const pnl = realizedPnl(book.fills);
-    const bankroll = book.settings.bankroll + pnl.closed;
-    const fill = paperTrade(data as Signal, bankroll, book);
+    const fill = paperTrade(data as Signal, book);
     if (fill) {
-      savePaperBook({ ...book, fills: [fill, ...book.fills].slice(0, 80) });
+      savePaperBook({ ...book, fills: truncateFills([fill, ...book.fills]) });
     }
     const next = loadPaperBook();
     const nextPnl = realizedPnl(next.fills);

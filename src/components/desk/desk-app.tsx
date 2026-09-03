@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
   ArrowUpRight,
@@ -13,9 +13,15 @@ import {
 import { toast } from "sonner";
 import { Area, AreaChart, ResponsiveContainer, Tooltip as RTooltip, XAxis, YAxis } from "recharts";
 import { fetchDeskSnapshot } from "@/lib/desk/server";
-import { realizedPnl, useDeskStore } from "@/lib/desk/store";
+import {
+  getPaperBookFn,
+  manualPaperTradeFn,
+  patchPaperSettingsFn,
+  resetPaperBookFn,
+} from "@/lib/desk/paper-api";
+import { useDeskStore } from "@/lib/desk/store";
 import { weatherLabel } from "@/lib/desk/parse";
-import type { DeskEvent, DeskSnapshot, MarketBucket, Signal, WeatherNow } from "@/lib/desk/types";
+import type { BotSettings, DeskEvent, DeskSnapshot, MarketBucket, Signal, WeatherNow } from "@/lib/desk/types";
 import { cn, convertTemp, formatPct, formatTemp, formatUsd } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -28,6 +34,27 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Skeleton } from "@/components/ui/skeleton";
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+const PAPER_BOOK_KEY = ["paper-book"] as const;
+
+const fallbackSettings: BotSettings = {
+  bankroll: 10_000,
+  kellyFraction: 0.12,
+  minEdge: 0.06,
+  minPrice: 0.05,
+  maxPrice: 0.85,
+  maxPosPct: 0.08,
+  armed: false,
+};
+
+function usePaperBookQuery() {
+  return useQuery({
+    queryKey: PAPER_BOOK_KEY,
+    queryFn: () => getPaperBookFn(),
+    refetchInterval: 25_000,
+    staleTime: 5_000,
+  });
+}
 
 function fmtDate(iso: string) {
   const [, m, d] = (iso || "").split("-");
@@ -42,6 +69,7 @@ function fmtTime(iso: string | null) {
 }
 
 export function DeskApp({ initial }: { initial: DeskSnapshot }) {
+  const queryClient = useQueryClient();
   const query = useQuery({
     queryKey: ["desk"],
     queryFn: () => fetchDeskSnapshot(),
@@ -49,13 +77,13 @@ export function DeskApp({ initial }: { initial: DeskSnapshot }) {
     refetchInterval: 25_000,
     staleTime: 12_000,
   });
+  const paper = usePaperBookQuery();
   const snapshot = query.data ?? initial;
   const selectedId = useDeskStore((s) => s.selectedEventId);
   const setSelected = useDeskStore((s) => s.setSelected);
-  const settings = useDeskStore((s) => s.settings);
-  const paperTrade = useDeskStore((s) => s.paperTrade);
-  const settle = useDeskStore((s) => s.settle);
-  const fills = useDeskStore((s) => s.fills);
+
+  const pnl = paper.data?.pnl ?? { closed: 0, openCost: 0 };
+  const equity = paper.data?.equity ?? fallbackSettings.bankroll + pnl.closed;
 
   const selected =
     snapshot.events.find((e) => e.eventId === selectedId) ?? snapshot.events[0] ?? null;
@@ -68,32 +96,31 @@ export function DeskApp({ initial }: { initial: DeskSnapshot }) {
     if (!selectedId && snapshot.events[0]) setSelected(snapshot.events[0].eventId);
   }, [selectedId, snapshot.events, setSelected]);
 
+  const toastedTick = useRef<string | null>(null);
   useEffect(() => {
-    for (const ev of snapshot.events) {
-      for (const b of ev.buckets) {
-        if (b.yesPrice >= 0.98) settle(b.marketId, true);
-        else if (b.yesPrice <= 0.02 && b.noPrice >= 0.98) settle(b.marketId, false);
-      }
-    }
-  }, [snapshot.events, settle]);
+    const at = paper.data?.book.lastTickAt;
+    const n = paper.data?.worker.filledLastTick ?? 0;
+    if (!at || n <= 0 || toastedTick.current === at) return;
+    toastedTick.current = at;
+    toast.message(`Bot filled ${n} paper order${n === 1 ? "" : "s"}`);
+  }, [paper.data?.book.lastTickAt, paper.data?.worker.filledLastTick]);
 
-  useEffect(() => {
-    if (!settings.armed) return;
-    const { closed } = realizedPnl(fills);
-    const bankroll = settings.bankroll + closed;
-    let n = 0;
-    for (const sig of snapshot.signals) {
-      if (sig.edge < settings.minEdge) continue;
-      const fill = paperTrade(sig, bankroll);
-      if (fill) n += 1;
-      if (n >= 4) break;
+  const onTrade = async (s: Signal) => {
+    try {
+      const res = await manualPaperTradeFn({ data: s });
+      queryClient.setQueryData(PAPER_BOOK_KEY, res);
+      if (res.fill) {
+        toast.success(`Paper ${s.side} ${s.label}`);
+      } else {
+        const reason = res.worker.liveLocked || res.book.lastError;
+        toast.message(reason ? String(reason) : "No fill (caps or filters)");
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Paper trade failed");
     }
-    if (n > 0) toast.message(`Bot filled ${n} paper order${n === 1 ? "" : "s"}`);
-  }, [snapshot.fetchedAt, settings.armed, settings.minEdge, settings.bankroll, snapshot.signals, paperTrade, fills]);
+  };
 
   const wx = selected ? snapshot.weather[selected.cityId] : undefined;
-  const pnl = realizedPnl(fills);
-  const equity = settings.bankroll + pnl.closed;
 
   return (
     <div className="min-h-dvh bg-background text-foreground">
@@ -111,10 +138,10 @@ export function DeskApp({ initial }: { initial: DeskSnapshot }) {
         <StatsRow snapshot={snapshot} equity={equity} openCost={pnl.openCost} />
         <div className="mt-4 hidden gap-4 lg:grid lg:grid-cols-[280px_minmax(0,1fr)_320px]">
           <CityRail events={snapshot.events} selectedId={selected?.eventId} onSelect={setSelected} weather={snapshot.weather} />
-          <Board event={selected} weather={wx} onTrade={(s) => paperTrade(s, equity)} />
+          <Board event={selected} weather={wx} onTrade={onTrade} />
           <aside className="flex flex-col gap-4">
             <BotCard />
-            <SignalsCard signals={snapshot.signals} onPick={setSelected} onTrade={(s) => paperTrade(s, equity)} />
+            <SignalsCard signals={snapshot.signals} onPick={setSelected} onTrade={onTrade} />
             <FillsCard />
           </aside>
         </div>
@@ -129,11 +156,11 @@ export function DeskApp({ initial }: { initial: DeskSnapshot }) {
               <CityRail events={snapshot.events} selectedId={selected?.eventId} onSelect={setSelected} weather={snapshot.weather} />
             </TabsContent>
             <TabsContent value="board">
-              <Board event={selected} weather={wx} onTrade={(s) => paperTrade(s, equity)} />
+              <Board event={selected} weather={wx} onTrade={onTrade} />
             </TabsContent>
             <TabsContent value="bot" className="flex flex-col gap-4">
               <BotCard />
-              <SignalsCard signals={snapshot.signals} onPick={setSelected} onTrade={(s) => paperTrade(s, equity)} />
+              <SignalsCard signals={snapshot.signals} onPick={setSelected} onTrade={onTrade} />
               <FillsCard />
             </TabsContent>
           </Tabs>
@@ -157,13 +184,14 @@ function Header({
   pnl: number;
 }) {
   const [clock, setClock] = useState("");
+  const paper = usePaperBookQuery();
+  const armed = paper.data?.book.settings.armed ?? false;
   useEffect(() => {
     const tick = () => setClock(new Date().toISOString().slice(11, 19) + "Z");
     tick();
     const id = setInterval(tick, 1000);
     return () => clearInterval(id);
   }, []);
-  const armed = useDeskStore((s) => s.settings.armed);
 
   return (
     <header className="sticky top-0 z-30 border-b border-border bg-background/90 backdrop-blur-sm">
@@ -473,10 +501,7 @@ function BucketRow({
           variant="outline"
           size="sm"
           disabled={showEdge < 0.03 || signal.marketP < 0.04 || signal.marketP > 0.9}
-          onClick={() => {
-            onTrade(signal);
-            toast.success(`Paper ${side} ${bucket.label}`);
-          }}
+          onClick={() => onTrade(signal)}
         >
           {side} {formatPct(signal.marketP, 0)}
         </Button>
@@ -486,29 +511,55 @@ function BucketRow({
 }
 
 function BotCard() {
-  const settings = useDeskStore((s) => s.settings);
-  const patch = useDeskStore((s) => s.patchSettings);
-  const resetBook = useDeskStore((s) => s.resetBook);
+  const queryClient = useQueryClient();
+  const paper = usePaperBookQuery();
+  const settings = paper.data?.book.settings ?? fallbackSettings;
+  const liveLocked = paper.data?.worker.liveLocked;
+
+  async function patch(partial: Partial<BotSettings>) {
+    try {
+      const res = await patchPaperSettingsFn({ data: partial });
+      queryClient.setQueryData(PAPER_BOOK_KEY, res);
+      if (partial.armed === true && !res.book.settings.armed) {
+        toast.error(res.worker.liveLocked || res.book.lastError || "Could not arm");
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Settings update failed");
+    }
+  }
+
+  async function onReset() {
+    try {
+      const res = await resetPaperBookFn();
+      queryClient.setQueryData(PAPER_BOOK_KEY, res);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not clear fills");
+    }
+  }
+
   return (
     <div className="rounded-xl bg-card p-4 shadow-[var(--shadow-border)]">
       <div className="flex items-center justify-between gap-3">
         <div>
           <h2 className="text-sm font-medium">Paper bot</h2>
-          <p className="text-xs text-muted-foreground">Kelly-sized. No live CLOB orders.</p>
+          <p className="text-xs text-muted-foreground">Kelly-sized. No live CLOB orders. Server worker fills when armed.</p>
         </div>
         <div className="flex items-center gap-2">
           <Label htmlFor="arm">Arm</Label>
-          <Switch id="arm" checked={settings.armed} onCheckedChange={(v) => patch({ armed: v })} />
+          <Switch id="arm" checked={settings.armed} onCheckedChange={(v) => void patch({ armed: v })} />
         </div>
       </div>
+      {typeof liveLocked === "string" && liveLocked ? (
+        <p className="mt-2 text-xs text-warn">{liveLocked}</p>
+      ) : null}
       <Separator className="my-3" />
       <div className="grid grid-cols-2 gap-3">
-        <Field label="Bankroll" value={settings.bankroll} onChange={(n) => patch({ bankroll: n })} />
-        <Field label="Kelly frac" value={settings.kellyFraction} step={0.01} onChange={(n) => patch({ kellyFraction: n })} />
-        <Field label="Min edge" value={settings.minEdge} step={0.01} onChange={(n) => patch({ minEdge: n })} />
-        <Field label="Max pos %" value={settings.maxPosPct} step={0.01} onChange={(n) => patch({ maxPosPct: n })} />
+        <Field label="Bankroll" value={settings.bankroll} onChange={(n) => void patch({ bankroll: n })} />
+        <Field label="Kelly frac" value={settings.kellyFraction} step={0.01} onChange={(n) => void patch({ kellyFraction: n })} />
+        <Field label="Min edge" value={settings.minEdge} step={0.01} onChange={(n) => void patch({ minEdge: n })} />
+        <Field label="Max pos %" value={settings.maxPosPct} step={0.01} onChange={(n) => void patch({ maxPosPct: n })} />
       </div>
-      <Button variant="ghost" className="mt-3 w-full" onClick={resetBook}>
+      <Button variant="ghost" className="mt-3 w-full" onClick={() => void onReset()}>
         Clear fills
       </Button>
     </div>
@@ -572,7 +623,8 @@ function SignalsCard({
 }
 
 function FillsCard() {
-  const fills = useDeskStore((s) => s.fills);
+  const paper = usePaperBookQuery();
+  const fills = paper.data?.book.fills ?? [];
   return (
     <div className="rounded-xl bg-card shadow-[var(--shadow-border)]">
       <div className="px-4 py-3">
