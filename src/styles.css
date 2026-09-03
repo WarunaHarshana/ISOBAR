@@ -1,0 +1,91 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@theme {
+  --font-sans: "Instrument Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", monospace;
+
+  --color-background: #0a0c0f;
+  --color-foreground: #eceff3;
+  --color-card: #12161c;
+  --color-card-foreground: #eceff3;
+  --color-popover: #161b22;
+  --color-popover-foreground: #eceff3;
+  --color-muted: #181e26;
+  --color-muted-foreground: #8d97a3;
+  --color-primary: #d7dce2;
+  --color-primary-foreground: #0a0c0f;
+  --color-secondary: #1a2028;
+  --color-secondary-foreground: #eceff3;
+  --color-accent: #1c242e;
+  --color-accent-foreground: #eceff3;
+  --color-border: rgb(236 239 243 / 0.08);
+  --color-input: rgb(236 239 243 / 0.1);
+  --color-ring: #d7dce2;
+  --color-destructive: #c97878;
+  --color-destructive-foreground: #0a0c0f;
+
+  --color-signal: #6fb8a8;
+  --color-signal-fg: #07110f;
+  --color-warn: #c4a36a;
+  --color-warn-fg: #16120a;
+  --color-danger: #c97878;
+  --color-rail: #0e1217;
+
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+  --radius-xl: 22px;
+  --radius: 10px;
+
+  --shadow-border: 0 0 0 1px rgb(236 239 243 / 0.08);
+  --shadow-border-hover: 0 0 0 1px rgb(236 239 243 / 0.14);
+}
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  * {
+    border-color: var(--color-border);
+  }
+  html,
+  body,
+  #app {
+    min-height: 100%;
+    background: var(--color-background);
+    color: var(--color-foreground);
+  }
+  body {
+    font-family: var(--font-sans);
+    line-height: 1.5;
+  }
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+  h1, h2, h3 {
+    text-wrap: balance;
+  }
+  p {
+    text-wrap: pretty;
+  }
+}
+
+@layer utilities {
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
