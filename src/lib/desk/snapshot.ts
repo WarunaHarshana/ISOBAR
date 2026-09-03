@@ -158,8 +158,9 @@ export async function buildDeskSnapshot(): Promise<DeskSnapshot> {
   signals.sort((a, b) => b.edge - a.edge);
   deskEvents.sort((a, b) => b.volume24hr - a.volume24hr);
 
+  // Drop heavy per-date member vectors after pricing, but keep membersC so the UI
+  // can show the real ensemble size (clearing it made "Ensemble 0 members").
   for (const w of Object.values(weather)) {
-    w.membersC = [];
     w.membersByDate = {};
     w.hourly = w.hourly.slice(0, 24);
   }
