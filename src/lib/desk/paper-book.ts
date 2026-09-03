@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { BotSettings, PaperFill, Side, Signal } from "./types";
-import { plausibilityVeto, type PlausibilityCtx } from "./plausibility";
+import { plausibilityVeto, type PlausibilityCtx } from "./plausibility.ts";
 
 export type PaperBook = {
   settings: BotSettings;

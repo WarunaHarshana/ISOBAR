@@ -1,6 +1,6 @@
 import type { CityMeta, HourPoint, WeatherNow } from "./types";
-import { cached, fetchJson } from "./cache";
-import { mean, stdev } from "./math";
+import { cached, fetchJson } from "./cache.ts";
+import { mean, stdev } from "./math.ts";
 
 type EnsembleResult = {
   latitude: number;
@@ -41,6 +41,13 @@ type Metar = {
   name?: string;
 };
 
+type EnsembleMap = Map<string, { members: number[]; dates: string[] }>;
+
+export type WeatherLoadResult = {
+  weather: Record<string, WeatherNow>;
+  ensembleError: string | null;
+};
+
 function asList<T>(raw: T | T[]): T[] {
   return Array.isArray(raw) ? raw : [raw];
 }
@@ -61,12 +68,26 @@ function dayIndexFor(dates: string[] | undefined, eventDate: string) {
   return i >= 0 ? i : 0;
 }
 
-export async function loadWeather(cities: CityMeta[]): Promise<Record<string, WeatherNow>> {
-  const unique = [...new Map(cities.filter((c) => c.lat !== 0 || c.lon !== 0).map((c) => [c.id, c])).values()];
-  if (!unique.length) return {};
+function errorMessage(err: unknown) {
+  return err instanceof Error ? err.message : String(err);
+}
 
-  const [ensemble, previous, metars] = await Promise.all([
-    loadEnsemble(unique).catch(() => null),
+function mergeEnsemble(target: EnsembleMap, source: EnsembleMap) {
+  for (const [k, v] of source.entries()) target.set(k, v);
+}
+
+function chunk<T>(items: T[], size: number) {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
+export async function loadWeather(cities: CityMeta[]): Promise<WeatherLoadResult> {
+  const unique = [...new Map(cities.filter((c) => c.lat !== 0 || c.lon !== 0).map((c) => [c.id, c])).values()];
+  if (!unique.length) return { weather: {}, ensembleError: null };
+
+  const [{ map: ensemble, error: ensembleError }, previous, metars] = await Promise.all([
+    loadEnsemble(unique),
     loadPrevious(unique).catch(() => null),
     loadMetars(unique).catch(() => null),
   ]);
@@ -85,18 +106,17 @@ export async function loadWeather(cities: CityMeta[]): Promise<Record<string, We
     const currentC = metarC ?? prev?.currentC ?? (hourly[0]?.tempC ?? null);
     const observedMaxC = [observedFromHourly, metarC, currentC].filter((n): n is number => n != null).reduce((a, b) => Math.max(a, b), -Infinity);
     const membersByDate: Record<string, number[]> = {};
-    if (ensemble) {
-      for (const [key, val] of ensemble.entries()) {
-        if (key === city.id) continue;
-        if (key.startsWith(`${city.id}:`)) {
-          membersByDate[key.slice(city.id.length + 1)] = val.members;
-        }
+    for (const [key, val] of ensemble.entries()) {
+      if (key === city.id) continue;
+      if (key.startsWith(`${city.id}:`)) {
+        membersByDate[key.slice(city.id.length + 1)] = val.members;
       }
     }
     const localDate = new Intl.DateTimeFormat("en-CA", { timeZone: city.tz }).format(new Date());
     const members = membersByDate[localDate] ?? ens?.members ?? [];
+    const hasMembers = members.length > 0 || Object.values(membersByDate).some((m) => m.length > 0);
     const sources = [
-      ens ? "Open-Meteo ensemble" : null,
+      hasMembers ? "Open-Meteo ensemble" : null,
       prev ? "Open-Meteo forecast" : null,
       metar ? `METAR ${city.icao}` : null,
     ].filter(Boolean) as string[];
@@ -122,16 +142,16 @@ export async function loadWeather(cities: CityMeta[]): Promise<Record<string, We
     };
   }
 
-  return out;
+  return { weather: out, ensembleError };
 }
 
-async function loadEnsemble(cities: CityMeta[]) {
+async function fetchEnsemble(cities: CityMeta[]): Promise<EnsembleMap> {
   const lats = cities.map((c) => c.lat.toFixed(4)).join(",");
   const lons = cities.map((c) => c.lon.toFixed(4)).join(",");
   const url = `https://ensemble-api.open-meteo.com/v1/ensemble?latitude=${lats}&longitude=${lons}&daily=temperature_2m_max,temperature_2m_min&forecast_days=4&timezone=auto`;
-  const raw = await cached(`ens:${lats}`, 8 * 60_000, () => fetchJson<EnsembleResult | EnsembleResult[]>(url));
+  const raw = await cached(`ens:${lats}:${lons}`, 8 * 60_000, () => fetchJson<EnsembleResult | EnsembleResult[]>(url));
   const list = asList(raw);
-  const map = new Map<string, { members: number[]; dates: string[] }>();
+  const map: EnsembleMap = new Map();
   for (let i = 0; i < list.length && i < cities.length; i++) {
     const row = list[i];
     const city = cities[i];
@@ -144,6 +164,39 @@ async function loadEnsemble(cities: CityMeta[]) {
     }
   }
   return map;
+}
+
+async function loadEnsemble(cities: CityMeta[]) {
+  try {
+    return { map: await fetchEnsemble(cities), error: null as string | null };
+  } catch (err) {
+    console.warn(`[isobar] Open-Meteo ensemble full batch failed: ${errorMessage(err)}`);
+  }
+
+  const map: EnsembleMap = new Map();
+  const chunkSize = 10;
+  for (const group of chunk(cities, chunkSize)) {
+    try {
+      mergeEnsemble(map, await fetchEnsemble(group));
+      continue;
+    } catch (err) {
+      const ids = group.map((c) => c.id).join(",");
+      console.warn(`[isobar] Open-Meteo ensemble chunk failed (${ids}): ${errorMessage(err)}`);
+    }
+    for (const city of group) {
+      try {
+        mergeEnsemble(map, await fetchEnsemble([city]));
+      } catch (err) {
+        console.warn(`[isobar] Open-Meteo ensemble city failed (${city.id}): ${errorMessage(err)}`);
+      }
+    }
+  }
+
+  const missing = cities.filter((c) => !map.has(c.id)).map((c) => c.name || c.id);
+  if (!missing.length) return { map, error: null as string | null };
+  const error = `Open-Meteo ensemble unavailable for ${missing.join(", ")}`;
+  console.warn(`[isobar] ${error}`);
+  return { map, error };
 }
 
 async function loadPrevious(cities: CityMeta[]) {
