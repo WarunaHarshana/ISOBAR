@@ -131,10 +131,19 @@ export async function tickPaperWorker(): Promise<PaperBook> {
       for (const sig of snapshot.signals) {
         if (sig.edge < PAPER_MIN_EDGE) continue;
         const bucket = snapshot.events.flatMap((e) => e.buckets).find((b) => b.marketId === sig.marketId);
+        const wx = snapshot.weather[sig.cityId];
+        const members =
+          wx?.membersByDate?.[sig.date] ??
+          wx?.membersC ??
+          undefined;
         const draft = { ...book, fills: nextFills };
         const fill = paperTrade(sig, draft, {
           bestBid: bucket?.bestBid ?? null,
           bestAsk: bucket?.bestAsk ?? null,
+          members,
+          observedC: wx?.observedMaxC ?? null,
+          lo: bucket?.lo,
+          hi: bucket?.hi,
         });
         if (!fill) continue;
         nextFills.unshift(fill);
