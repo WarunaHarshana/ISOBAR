@@ -193,7 +193,8 @@ export async function buildDeskSnapshot(): Promise<DeskSnapshot> {
   deskEvents.sort((a, b) => b.volume24hr - a.volume24hr);
 
   for (const w of Object.values(weather)) {
-    w.membersByDate = {};
+    // Keep membersByDate for the paper worker (sig.date). Clearing it forced a
+    // membersC fallback and priced tomorrow's markets on today's members.
     w.hourly = w.hourly.slice(0, 24);
   }
 
@@ -213,10 +214,8 @@ export async function buildDeskSnapshot(): Promise<DeskSnapshot> {
   };
 }
 
+/** Quant: members only from membersByDate[eventDate]. Never membersC / ens.members. */
 function membersForEvent(wx: WeatherNow | undefined, eventDate: string) {
   if (!wx) return [];
-  const dated = wx.membersByDate?.[eventDate];
-  if (dated?.length) return dated;
-  if (wx.localDate === eventDate && wx.membersC?.length) return wx.membersC;
-  return [];
+  return wx.membersByDate?.[eventDate] ?? [];
 }
