@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { BotSettings, PaperFill, Signal } from "./types";
+import type { BotSettings, PaperFill, Side, Signal } from "./types";
 
 export type PaperBook = {
   settings: BotSettings;
@@ -9,6 +9,12 @@ export type PaperBook = {
   lastError: string | null;
   ticks: number;
   filledLastTick: number;
+};
+
+export type PaperTradeOpts = {
+  bestBid?: number | null;
+  bestAsk?: number | null;
+  fillPrice?: number | null;
 };
 
 /** Quant freeze — keep worker + UI floors identical. */
@@ -35,11 +41,16 @@ const defaults: BotSettings = {
 };
 
 function dataPath() {
-  const dir = process.env.ISOBAR_DATA_DIR || "/tmp/isobar";
+  const dir = process.env.ISOBAR_DATA_DIR || "/data";
   return join(dir, "paper-book.json");
 }
 
 let book: PaperBook | null = null;
+
+/** Test helper — clear the in-memory cache between cases. */
+export function _resetPaperBookCache() {
+  book = null;
+}
 
 export function emptyBook(): PaperBook {
   return {
@@ -178,17 +189,27 @@ export function truncateFills(fills: PaperFill[]): PaperFill[] {
   return [...open, ...closed.slice(0, room)];
 }
 
-function fillPrice(signal: Signal, ask: number | null | undefined) {
-  if (ask != null && Number.isFinite(ask) && ask > 0) {
-    return Math.max(signal.marketP, ask);
+/**
+ * Worse (higher) fill price for paper buys.
+ * YES uses ask; NO uses bid as the adverse quote when ask is absent.
+ */
+export function conservativeFillPrice(
+  side: Side,
+  mid: number,
+  bestBid: number | null | undefined,
+  bestAsk: number | null | undefined,
+): number {
+  const quote = side === "YES" ? bestAsk : bestBid;
+  if (quote != null && Number.isFinite(quote) && quote > 0) {
+    return Math.max(mid, quote);
   }
-  return signal.marketP;
+  return mid;
 }
 
 export function paperTrade(
   signal: Signal,
   current: PaperBook = loadPaperBook(),
-  ask?: number | null,
+  opts?: PaperTradeOpts | number | null,
 ): PaperFill | null {
   const { fills } = current;
   if (liveTradingLocked()) return null;
@@ -197,10 +218,25 @@ export function paperTrade(
   if (open.length >= PAPER_MAX_OPEN) return null;
   if (open.some((f) => f.marketId === signal.marketId && f.side === signal.side)) return null;
   if (open.filter((f) => f.eventId === signal.eventId).length >= PAPER_MAX_OPEN_PER_EVENT) return null;
-  if (open.filter((f) => f.cityName === signal.cityName).length >= PAPER_MAX_OPEN_PER_CITY_DATE) return null;
+  if (
+    open.filter((f) => f.cityId === signal.cityId && f.date === signal.date).length >=
+    PAPER_MAX_OPEN_PER_CITY_DATE
+  ) {
+    return null;
+  }
 
   if (signal.edge < PAPER_MIN_EDGE) return null;
-  const price = fillPrice(signal, ask);
+
+  let price: number;
+  if (typeof opts === "number" || opts == null) {
+    // Legacy: third arg was YES ask.
+    price = conservativeFillPrice(signal.side, signal.marketP, null, opts ?? null);
+  } else if (opts.fillPrice != null && Number.isFinite(opts.fillPrice) && opts.fillPrice > 0) {
+    price = opts.fillPrice;
+  } else {
+    price = conservativeFillPrice(signal.side, signal.marketP, opts.bestBid, opts.bestAsk);
+  }
+
   if (price < PAPER_MIN_PRICE || price > PAPER_MAX_PRICE) return null;
 
   const cash = availableCash(current);
@@ -214,7 +250,9 @@ export function paperTrade(
     id: `${signal.marketId}-${signal.side}-${Date.now()}`,
     eventId: signal.eventId,
     marketId: signal.marketId,
+    cityId: signal.cityId,
     cityName: signal.cityName,
+    date: signal.date,
     question: signal.question,
     side: signal.side,
     price,
