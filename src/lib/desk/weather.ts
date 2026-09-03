@@ -48,7 +48,7 @@ type EnsembleLoad = {
   error: string | null;
 };
 
-const ENSEMBLE_CHUNK = 4;
+const ENSEMBLE_CHUNK = 8;
 const ENSEMBLE_TTL = 8 * 60_000;
 const ENSEMBLE_TIMEOUT_MS = 20_000;
 
@@ -66,6 +66,18 @@ function memberValues(daily: Record<string, Array<number | string | null>>, dayI
   return out;
 }
 
+/** Quant: never batch mixed timezones with timezone=auto. */
+export function groupCitiesByTimezone(cities: CityMeta[]): Map<string, CityMeta[]> {
+  const groups = new Map<string, CityMeta[]>();
+  for (const city of cities) {
+    const tz = city.tz || "UTC";
+    const list = groups.get(tz);
+    if (list) list.push(city);
+    else groups.set(tz, [city]);
+  }
+  return groups;
+}
+
 function parseEnsemble(raw: EnsembleResult | EnsembleResult[], cities: CityMeta[]) {
   const list = asList(raw);
   const map = new Map<string, EnsembleEntry>();
@@ -81,12 +93,14 @@ function parseEnsemble(raw: EnsembleResult | EnsembleResult[], cities: CityMeta[
   return map;
 }
 
-async function fetchEnsembleBatch(cities: CityMeta[]) {
+async function fetchEnsembleBatch(cities: CityMeta[], timezone: string) {
   if (!cities.length) return new Map<string, EnsembleEntry>();
   const lats = cities.map((c) => c.lat.toFixed(4)).join(",");
   const lons = cities.map((c) => c.lon.toFixed(4)).join(",");
-  const url = `https://ensemble-api.open-meteo.com/v1/ensemble?latitude=${lats}&longitude=${lons}&daily=temperature_2m_max,temperature_2m_min&forecast_days=4&timezone=auto`;
-  const raw = await cached(`ens:${lats}`, ENSEMBLE_TTL, () =>
+  const tz = encodeURIComponent(timezone);
+  const url = `https://ensemble-api.open-meteo.com/v1/ensemble?latitude=${lats}&longitude=${lons}&daily=temperature_2m_max,temperature_2m_min&forecast_days=4&timezone=${tz}`;
+  const cacheKey = `ens:tz:${timezone}:${cities.map((c) => c.id).join(",")}`;
+  const raw = await cached(cacheKey, ENSEMBLE_TTL, () =>
     fetchJson<EnsembleResult | EnsembleResult[]>(url, {}, ENSEMBLE_TIMEOUT_MS),
   );
   return parseEnsemble(raw, cities);
@@ -97,8 +111,9 @@ function mergeEnsemble(into: Map<string, EnsembleEntry>, from: Map<string, Ensem
 }
 
 function cityInMap(map: Map<string, EnsembleEntry>, cityId: string) {
+  const prefix = `${cityId}:`;
   for (const key of map.keys()) {
-    if (key === cityId || key.startsWith(`${cityId}:`)) return true;
+    if (key.startsWith(prefix)) return true;
   }
   return false;
 }
@@ -107,10 +122,10 @@ async function loadEnsemble(cities: CityMeta[]): Promise<EnsembleLoad> {
   const map = new Map<string, EnsembleEntry>();
   if (!cities.length) return { map, error: null };
 
-  const tryBatch = async (batch: CityMeta[], label: string) => {
+  const tryBatch = async (batch: CityMeta[], timezone: string, label: string) => {
     try {
-      mergeEnsemble(map, await fetchEnsembleBatch(batch));
-      return null;
+      mergeEnsemble(map, await fetchEnsembleBatch(batch, timezone));
+      return null as string | null;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[isobar] ensemble ${label} failed`, msg);
@@ -118,32 +133,20 @@ async function loadEnsemble(cities: CityMeta[]): Promise<EnsembleLoad> {
     }
   };
 
-  const batchErr = await tryBatch(cities, "batch");
-  if (!batchErr && cities.every((c) => cityInMap(map, c.id))) {
-    return { map, error: null };
-  }
-
-  if (batchErr) {
-    if (cities.length > ENSEMBLE_CHUNK) {
-      for (let i = 0; i < cities.length; i += ENSEMBLE_CHUNK) {
-        const chunk = cities.slice(i, i + ENSEMBLE_CHUNK);
-        const chunkErr = await tryBatch(chunk, `chunk ${Math.floor(i / ENSEMBLE_CHUNK) + 1}`);
-        if (!chunkErr) continue;
-        for (const city of chunk) {
+  for (const [tz, group] of groupCitiesByTimezone(cities)) {
+    const err = await tryBatch(group, tz, `tz ${tz}`);
+    if (!err && group.every((c) => cityInMap(map, c.id))) continue;
+    for (let i = 0; i < group.length; i += ENSEMBLE_CHUNK) {
+      const chunk = group.slice(i, i + ENSEMBLE_CHUNK);
+      const missing = chunk.filter((c) => !cityInMap(map, c.id));
+      if (!missing.length) continue;
+      const chunkErr = await tryBatch(missing, tz, `tz ${tz} chunk`);
+      if (chunkErr) {
+        for (const city of missing) {
           if (cityInMap(map, city.id)) continue;
-          await tryBatch([city], city.id);
+          await tryBatch([city], tz, city.id);
         }
       }
-    } else if (cities.length > 1) {
-      for (const city of cities) {
-        if (cityInMap(map, city.id)) continue;
-        await tryBatch([city], city.id);
-      }
-    }
-  } else {
-    for (const city of cities) {
-      if (cityInMap(map, city.id)) continue;
-      await tryBatch([city], `${city.id} fill`);
     }
   }
 
@@ -197,17 +200,20 @@ export async function loadWeather(cities: CityMeta[]): Promise<Record<string, We
     const observedFromHourly = pastHours.length ? Math.max(...pastHours.map((h) => h.tempC)) : null;
     const metarC = metar?.temp ?? null;
     const currentC = metarC ?? prev?.currentC ?? (hourly[0]?.tempC ?? null);
-    const observedMaxC = [observedFromHourly, metarC, currentC].filter((n): n is number => n != null).reduce((a, b) => Math.max(a, b), -Infinity);
+    const observedMaxC = [observedFromHourly, metarC, currentC]
+      .filter((n): n is number => n != null)
+      .reduce((a, b) => Math.max(a, b), -Infinity);
     const membersByDate: Record<string, number[]> = {};
+    const prefix = `${city.id}:`;
     for (const [key, val] of ensemble.map.entries()) {
-      if (key.startsWith(`${city.id}:`)) {
-        membersByDate[key.slice(city.id.length + 1)] = val.members;
+      if (key.startsWith(prefix)) {
+        membersByDate[key.slice(prefix.length)] = val.members;
       }
     }
     const localDate = new Intl.DateTimeFormat("en-CA", { timeZone: city.tz }).format(new Date());
+    // Quant: never ens.members / dates[0] fallback.
     const members = membersByDate[localDate] ?? [];
-    const hasEnsemble =
-      members.length > 0 || Object.values(membersByDate).some((m) => m.length > 0);
+    const hasEnsemble = Object.values(membersByDate).some((m) => m.length >= 8);
     const sources = [
       hasEnsemble ? "Open-Meteo ensemble" : null,
       prev ? "Open-Meteo forecast" : null,
@@ -231,7 +237,7 @@ export async function loadWeather(cities: CityMeta[]): Promise<Record<string, We
       membersByDate,
       localDate,
       hourly,
-      source: sources.join(" \u00b7 ") || "unavailable",
+      source: sources.join(" · ") || "unavailable",
     };
   }
 
