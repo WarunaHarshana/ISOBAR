@@ -48,12 +48,29 @@ type EnsembleLoad = {
   error: string | null;
 };
 
+type EnsembleGlobals = {
+  __isobarEnsInflight?: Promise<EnsembleLoad> | null;
+  __isobarEnsNegUntil?: number;
+  __isobarEnsNeg?: EnsembleLoad | null;
+};
+
 const ENSEMBLE_CHUNK = 8;
 const ENSEMBLE_TTL = 8 * 60_000;
 const ENSEMBLE_TIMEOUT_MS = 20_000;
+const ENSEMBLE_NEG_MS = 120_000;
+const ENSEMBLE_TZ_GAP_MS = 250;
+const ENSEMBLE_TRANSIENT_RETRY_MS = 1_000;
+
+function g(): EnsembleGlobals {
+  return globalThis as EnsembleGlobals;
+}
 
 function asList<T>(raw: T | T[]): T[] {
   return Array.isArray(raw) ? raw : [raw];
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function memberValues(daily: Record<string, Array<number | string | null>>, dayIndex: number) {
@@ -119,34 +136,59 @@ function cityInMap(map: Map<string, EnsembleEntry>, cityId: string) {
 }
 
 function isRateLimited(msg: string | null | undefined) {
-  return Boolean(msg && /\b429\b/.test(msg));
+  return Boolean(msg && (/\b429\b/.test(msg) || /\b403\b/.test(msg)));
 }
 
-let ensembleCooldownUntil = 0;
-let lastEnsembleLoad: EnsembleLoad | null = null;
-let ensembleInflight: Promise<EnsembleLoad> | null = null;
+function isUriTooLong(msg: string | null | undefined) {
+  return Boolean(msg && (/\b400\b/.test(msg) || /URI Too Long/i.test(msg)));
+}
+
+function isTransient(msg: string | null | undefined) {
+  return Boolean(msg && (/\b5\d\d\b/.test(msg) || /timeout|aborted/i.test(msg)));
+}
+
+function retryAfterMs(msg: string | null | undefined) {
+  const m = msg ? /retry-after=(\S+)/i.exec(msg) : null;
+  if (!m) return ENSEMBLE_NEG_MS;
+  const raw = m[1].replace(/[;,].*$/, "");
+  const sec = Number(raw);
+  if (Number.isFinite(sec) && sec >= 0) return Math.min(Math.max(sec * 1000, 1_000), 15 * 60_000);
+  const date = Date.parse(raw);
+  if (Number.isFinite(date)) return Math.min(Math.max(date - Date.now(), 1_000), 15 * 60_000);
+  return ENSEMBLE_NEG_MS;
+}
+
+function setNegativeCache(msg: string | null | undefined): EnsembleLoad {
+  const neg: EnsembleLoad = { map: new Map(), error: "ensemble rate-limited" };
+  g().__isobarEnsNeg = neg;
+  g().__isobarEnsNegUntil = Date.now() + retryAfterMs(msg);
+  console.error("[isobar] ensemble 429/403 negative cache", retryAfterMs(msg), "ms");
+  return neg;
+}
 
 /** Test helper — drop 429 cooldown + single-flight between cases. */
 export function _resetEnsembleGuards() {
-  ensembleCooldownUntil = 0;
-  lastEnsembleLoad = null;
-  ensembleInflight = null;
+  const glob = g();
+  glob.__isobarEnsInflight = null;
+  glob.__isobarEnsNegUntil = 0;
+  glob.__isobarEnsNeg = null;
 }
 
 async function loadEnsemble(cities: CityMeta[]): Promise<EnsembleLoad> {
   if (!cities.length) return { map: new Map(), error: null };
-  if (ensembleInflight) return ensembleInflight;
-  ensembleInflight = loadEnsembleOnce(cities).finally(() => {
-    ensembleInflight = null;
+  const glob = g();
+  const now = Date.now();
+  if (glob.__isobarEnsNegUntil && now < glob.__isobarEnsNegUntil) {
+    return glob.__isobarEnsNeg ?? { map: new Map(), error: "ensemble rate-limited" };
+  }
+  if (glob.__isobarEnsInflight) return glob.__isobarEnsInflight;
+  glob.__isobarEnsInflight = loadEnsembleOnce(cities).finally(() => {
+    glob.__isobarEnsInflight = null;
   });
-  return ensembleInflight;
+  return glob.__isobarEnsInflight;
 }
 
 async function loadEnsembleOnce(cities: CityMeta[]): Promise<EnsembleLoad> {
-  if (Date.now() < ensembleCooldownUntil) {
-    return lastEnsembleLoad ?? { map: new Map(), error: "ensemble rate-limited" };
-  }
-
   const map = new Map<string, EnsembleEntry>();
 
   const tryBatch = async (batch: CityMeta[], timezone: string, label: string) => {
@@ -160,42 +202,49 @@ async function loadEnsembleOnce(cities: CityMeta[]): Promise<EnsembleLoad> {
     }
   };
 
-  let rateLimited = false;
+  const tryBatchOnceRetry = async (batch: CityMeta[], timezone: string, label: string) => {
+    const err = await tryBatch(batch, timezone, label);
+    if (!isTransient(err) || isRateLimited(err)) return err;
+    await sleep(ENSEMBLE_TRANSIENT_RETRY_MS);
+    return tryBatch(batch, timezone, `${label} retry`);
+  };
+
+  let rateLimitedMsg: string | null = null;
+  let tzIndex = 0;
   for (const [tz, group] of groupCitiesByTimezone(cities)) {
-    if (rateLimited) break;
-    const err = await tryBatch(group, tz, `tz ${tz}`);
+    if (rateLimitedMsg) break;
+    if (tzIndex > 0) await sleep(ENSEMBLE_TZ_GAP_MS);
+    tzIndex += 1;
+    const err = await tryBatchOnceRetry(group, tz, `tz ${tz}`);
     if (!err && group.every((c) => cityInMap(map, c.id))) continue;
     if (isRateLimited(err)) {
-      rateLimited = true;
+      rateLimitedMsg = err;
       break;
     }
+    if (!isUriTooLong(err)) continue;
     for (let i = 0; i < group.length; i += ENSEMBLE_CHUNK) {
-      if (rateLimited) break;
+      if (rateLimitedMsg) break;
       const chunk = group.slice(i, i + ENSEMBLE_CHUNK);
       const missing = chunk.filter((c) => !cityInMap(map, c.id));
       if (!missing.length) continue;
-      const chunkErr = await tryBatch(missing, tz, `tz ${tz} chunk`);
+      const chunkErr = await tryBatchOnceRetry(missing, tz, `tz ${tz} chunk`);
       if (isRateLimited(chunkErr)) {
-        rateLimited = true;
+        rateLimitedMsg = chunkErr;
         break;
       }
-      if (chunkErr) {
-        for (const city of missing) {
-          if (cityInMap(map, city.id)) continue;
-          const cityErr = await tryBatch([city], tz, city.id);
-          if (isRateLimited(cityErr)) {
-            rateLimited = true;
-            break;
-          }
+      if (!isUriTooLong(chunkErr)) continue;
+      for (const city of missing) {
+        if (cityInMap(map, city.id)) continue;
+        const cityErr = await tryBatchOnceRetry([city], tz, city.id);
+        if (isRateLimited(cityErr)) {
+          rateLimitedMsg = cityErr;
+          break;
         }
       }
     }
   }
 
-  if (rateLimited) {
-    ensembleCooldownUntil = Date.now() + ENSEMBLE_TTL;
-    console.error("[isobar] ensemble 429 cooldown", ENSEMBLE_TTL, "ms");
-  }
+  if (rateLimitedMsg) return setNegativeCache(rateLimitedMsg);
 
   const failed = cities.filter((c) => !cityInMap(map, c.id)).map((c) => c.id);
   let error: string | null = null;
@@ -207,9 +256,7 @@ async function loadEnsembleOnce(cities: CityMeta[]): Promise<EnsembleLoad> {
     console.error("[isobar]", error);
     if (failed.length !== cities.length) error = null;
   }
-  const result: EnsembleLoad = { map, error };
-  lastEnsembleLoad = result;
-  return result;
+  return { map, error };
 }
 
 export async function loadWeather(cities: CityMeta[]): Promise<Record<string, WeatherNow>> {
