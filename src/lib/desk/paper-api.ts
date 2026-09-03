@@ -1,6 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import {
+  availableCash,
   loadPaperBook,
   paperTrade,
   patchSettings,
@@ -43,50 +44,42 @@ const signalSchema = z.object({
   volume24hr: z.number(),
 });
 
-export const getPaperBookFn = createServerFn({ method: "GET" }).handler(async () => {
-  startPaperWorker();
+function bookPayload() {
   const book = loadPaperBook();
   const pnl = realizedPnl(book.fills);
   return {
     book,
     worker: getWorkerStatus(),
     equity: book.settings.bankroll + pnl.closed,
+    cash: availableCash(book),
     pnl,
   };
+}
+
+export const getPaperBookFn = createServerFn({ method: "GET" }).handler(async () => {
+  startPaperWorker();
+  return bookPayload();
 });
 
 export const patchPaperSettingsFn = createServerFn({ method: "POST" })
-  .inputValidator((input: unknown) => settingsPatchSchema.parse(input))
+  .validator((input: unknown) => settingsPatchSchema.parse(input))
   .handler(async ({ data }) => {
     startPaperWorker();
-    const book = patchSettings(data);
-    // If newly armed, tick immediately so fills do not wait a full interval.
+    patchSettings(data);
     if (data.armed === true) {
       await tickPaperWorker();
     }
-    const pnl = realizedPnl(book.fills);
-    return {
-      book: loadPaperBook(),
-      worker: getWorkerStatus(),
-      equity: book.settings.bankroll + pnl.closed,
-      pnl,
-    };
+    return bookPayload();
   });
 
 export const resetPaperBookFn = createServerFn({ method: "POST" }).handler(async () => {
   startPaperWorker();
-  const book = resetBook();
-  const pnl = realizedPnl(book.fills);
-  return {
-    book,
-    worker: getWorkerStatus(),
-    equity: book.settings.bankroll + pnl.closed,
-    pnl,
-  };
+  resetBook();
+  return bookPayload();
 });
 
 export const manualPaperTradeFn = createServerFn({ method: "POST" })
-  .inputValidator((input: unknown) => signalSchema.parse(input))
+  .validator((input: unknown) => signalSchema.parse(input))
   .handler(async ({ data }) => {
     startPaperWorker();
     const book = loadPaperBook();
@@ -94,13 +87,5 @@ export const manualPaperTradeFn = createServerFn({ method: "POST" })
     if (fill) {
       savePaperBook({ ...book, fills: truncateFills([fill, ...book.fills]) });
     }
-    const next = loadPaperBook();
-    const nextPnl = realizedPnl(next.fills);
-    return {
-      fill,
-      book: next,
-      worker: getWorkerStatus(),
-      equity: next.settings.bankroll + nextPnl.closed,
-      pnl: nextPnl,
-    };
+    return { fill, ...bookPayload() };
   });
