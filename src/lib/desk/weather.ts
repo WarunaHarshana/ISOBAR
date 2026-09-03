@@ -94,7 +94,8 @@ export async function loadWeather(cities: CityMeta[]): Promise<Record<string, We
       }
     }
     const localDate = new Intl.DateTimeFormat("en-CA", { timeZone: city.tz }).format(new Date());
-    const members = membersByDate[localDate] ?? ens?.members ?? [];
+    // Quant: never fall back to ens.members (API dates[0] can be the wrong event day).
+    const members = membersByDate[localDate] ?? [];
     const sources = [
       ens ? "Open-Meteo ensemble" : null,
       prev ? "Open-Meteo forecast" : null,
