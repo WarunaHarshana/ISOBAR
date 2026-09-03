@@ -94,8 +94,8 @@ const originalFetch = globalThis.fetch;
 describe("weather ensemble behavior", () => {
   it("ensemble success populates members and source", async () => {
     globalThis.fetch = (async (url: string | URL) => {
-      const href = String(url);
-      if (href.includes("ensemble-api.open-meteo.com")) {
+      const parsed = new URL(String(url));
+      if (parsed.hostname === "ensemble-api.open-meteo.com") {
         return new Response(
           JSON.stringify({
             daily: {
@@ -107,7 +107,7 @@ describe("weather ensemble behavior", () => {
           { status: 200, headers: { "content-type": "application/json" } },
         );
       }
-      if (href.includes("previous-runs-api.open-meteo.com")) {
+      if (parsed.hostname === "previous-runs-api.open-meteo.com") {
         return new Response(
           JSON.stringify({
             current: { temperature_2m: 22, relative_humidity_2m: 55, wind_speed_10m: 3, weather_code: 2 },
@@ -117,7 +117,7 @@ describe("weather ensemble behavior", () => {
           { status: 200, headers: { "content-type": "application/json" } },
         );
       }
-      if (href.includes("aviationweather.gov")) {
+      if (parsed.hostname === "aviationweather.gov") {
         return new Response(JSON.stringify([]), { status: 200, headers: { "content-type": "application/json" } });
       }
       return new Response("not found", { status: 404 });
