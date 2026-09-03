@@ -18,7 +18,7 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "db:migrate": "node scripts/migrate.mjs",
-    "test": "node --test 'scripts/**/*.test.mjs' && node --experimental-strip-types --test src/lib/app-data/app-data.test.ts src/lib/auth/gate-identity.test.ts src/lib/desk/paper-book.test.ts src/lib/desk/ensemble.test.ts src/lib/desk/snapshot-ensemble.test.ts"
+    "test": "node --test 'scripts/**/*.test.mjs' && node --experimental-strip-types --test src/lib/app-data/app-data.test.ts src/lib/auth/gate-identity.test.ts src/lib/desk/paper-book.test.ts src/lib/desk/plausibility.test.ts src/lib/desk/ensemble.test.ts src/lib/desk/snapshot-ensemble.test.ts"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.5.4",
