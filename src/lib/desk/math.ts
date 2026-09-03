@@ -1,4 +1,4 @@
-import { convertTemp } from "../utils";
+import { convertTemp } from "@/lib/utils";
 import type { TempUnit } from "./types";
 
 /** Abramowitz & Stegun erf approximation. */
