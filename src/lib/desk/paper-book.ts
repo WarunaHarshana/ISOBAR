@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { BotSettings, PaperFill, Side, Signal } from "./types";
+import { plausibilityVeto, type PlausibilityCtx } from "./plausibility";
 
 export type PaperBook = {
   settings: BotSettings;
@@ -15,6 +16,12 @@ export type PaperTradeOpts = {
   bestBid?: number | null;
   bestAsk?: number | null;
   fillPrice?: number | null;
+  /** Predictioner ctx — optional ensemble / obs / clock. */
+  members?: number[];
+  observedC?: number | null;
+  now?: Date;
+  lo?: number;
+  hi?: number;
 };
 
 /** Quant freeze — keep worker + UI floors identical. */
@@ -276,6 +283,22 @@ export function paperTrade(
   }
 
   if (price < PAPER_MIN_PRICE || price > PAPER_MAX_PRICE) return null;
+
+  // Predictioner gate — after fill price, before Kelly. Fail closed.
+  const plausCtx: PlausibilityCtx = {};
+  if (typeof opts === "object" && opts != null) {
+    if (opts.members != null) plausCtx.members = opts.members;
+    if (opts.observedC !== undefined) plausCtx.observedC = opts.observedC;
+    if (opts.now != null) plausCtx.now = opts.now;
+    if (opts.lo != null) plausCtx.lo = opts.lo;
+    if (opts.hi != null) plausCtx.hi = opts.hi;
+  }
+  try {
+    const veto = plausibilityVeto(signal, plausCtx);
+    if (!veto.ok) return null;
+  } catch {
+    return null;
+  }
 
   const cash = availableCash(current);
   if (cash <= 0) return null;
