@@ -1,7 +1,11 @@
 import { getWorkerStatus, startPaperWorker } from "../../src/lib/desk/paper-worker";
 import { loadPaperBook } from "../../src/lib/desk/paper-book";
 
-export default defineEventHandler(() => {
+/**
+ * Railway healthcheck. Plain default export — Nitro v3 in this stack does not
+ * inject defineEventHandler as a global (that caused /health → 500).
+ */
+export default function healthHandler() {
   startPaperWorker();
   const worker = getWorkerStatus();
   const book = loadPaperBook();
@@ -17,4 +21,4 @@ export default defineEventHandler(() => {
     },
     openFills: book.fills.filter((f) => f.status === "open").length,
   };
-});
+}
