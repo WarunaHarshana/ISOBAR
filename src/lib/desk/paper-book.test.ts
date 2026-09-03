@@ -129,9 +129,10 @@ describe("sizing", () => {
     assert.ok(fill!.cost >= PAPER_MIN_STAKE);
   });
 
-  it("skips stake under $5; worse of mid vs ask", () => {
+  it("skips stake under $5; YES ask / NO implied ask from yesBid", () => {
     assert.equal(conservativeFillPrice("YES", 0.4, 0.38, 0.45), 0.45);
     assert.equal(conservativeFillPrice("NO", 0.4, 0.5, null), 0.5);
+    assert.equal(conservativeFillPrice("NO", 0.4, 0.7, null), 0.4);
     assert.equal(paperTrade(signal({ kelly: 0.001 }), emptyBook()), null);
   });
 
