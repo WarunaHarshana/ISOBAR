@@ -209,3 +209,45 @@ describe("persist", () => {
     assert.equal(loadPaperBook().settings.bankroll, 12345);
   });
 });
+
+describe("predictioner gate", () => {
+  it("Helsinki 40°C winter YES with thin members returns null", () => {
+    const hel = signal({
+      cityId: "helsinki",
+      cityName: "Helsinki",
+      date: "2026-01-15",
+      kind: "high",
+      unit: "C",
+      label: "40°C",
+      question: "Will the highest temperature in Helsinki be 40°C?",
+      side: "YES",
+      marketP: 0.2,
+      modelP: 0.25,
+      edge: 0.15,
+      kelly: 0.5,
+    });
+    assert.equal(paperTrade(hel, emptyBook(), { fillPrice: 0.2, members: [] }), null);
+    assert.equal(
+      paperTrade(hel, emptyBook(), { fillPrice: 0.2, members: [1, 2, 3] }),
+      null,
+    );
+  });
+
+  it("Helsinki 40°C Jan YES vetoes even with fat ensemble (climatology)", () => {
+    const hel = signal({
+      cityId: "helsinki",
+      cityName: "Helsinki",
+      date: "2026-01-15",
+      kind: "high",
+      unit: "C",
+      label: "40°C",
+      side: "YES",
+      marketP: 0.2,
+      modelP: 0.25,
+      edge: 0.15,
+      kelly: 0.5,
+    });
+    const members = Array.from({ length: 31 }, () => -2);
+    assert.equal(paperTrade(hel, emptyBook(), { fillPrice: 0.2, members }), null);
+  });
+});
