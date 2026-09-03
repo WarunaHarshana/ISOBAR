@@ -1,5 +1,5 @@
-import { convertTemp } from "@/lib/utils";
-import { loadWeatherEvents } from "./polymarket";
+import { convertTemp } from "../utils";
+import { loadWeatherEvents, type ParsedEvent } from "./polymarket";
 import { loadWeather } from "./weather";
 import { bucketProbability, impliedTemp, kellyFraction, mean } from "./math";
 import { PAPER_MAX_PRICE, PAPER_MIN_EDGE, PAPER_MIN_PRICE } from "./paper-book";
@@ -10,9 +10,23 @@ const MIN_TRADE_PRICE = PAPER_MIN_PRICE;
 const MAX_TRADE_PRICE = PAPER_MAX_PRICE;
 const MIN_EDGE = PAPER_MIN_EDGE;
 const MAX_SPREAD = 0.15;
+const SETTLED_PRICE = 0.98;
+
+export const ENSEMBLE_UNAVAILABLE = "Open-Meteo ensemble unavailable (need >=8 members)";
+
+/** Dated members only. Never fall back to membersC (may be another calendar day). */
+export function membersForEvent(wx: WeatherNow | undefined, eventDate: string): number[] {
+  const dated = wx?.membersByDate?.[eventDate];
+  return Array.isArray(dated) ? dated : [];
+}
+
+function weatherHasDatedEnsemble(w: WeatherNow | undefined) {
+  if (!w) return false;
+  return Object.values(w.membersByDate ?? {}).some((m) => ensembleOk(m));
+}
 
 export async function buildDeskSnapshot(): Promise<DeskSnapshot> {
-  let events: Awaited<ReturnType<typeof loadWeatherEvents>> = [];
+  let events: ParsedEvent[] = [];
   let warning: string | null = null;
   try {
     events = await loadWeatherEvents();
@@ -21,15 +35,34 @@ export async function buildDeskSnapshot(): Promise<DeskSnapshot> {
   }
   const cities = [...new Map(events.map((e) => [e.city.id, e.city])).values()];
   let weather: Record<string, WeatherNow> = {};
-  const sources = new Set<string>();
   try {
     weather = await loadWeather(cities);
-    for (const w of Object.values(weather)) {
-      for (const part of w.source.split(" · ")) if (part) sources.add(part);
-    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Weather feed unavailable";
-    warning = warning ? `${warning} · ${msg}` : msg;
+    warning = warning ? `${warning} \u00b7 ${msg}` : msg;
+  }
+  return assembleDeskSnapshot({ events, weather, warning });
+}
+
+export function assembleDeskSnapshot(opts: {
+  events: ParsedEvent[];
+  weather: Record<string, WeatherNow>;
+  warning?: string | null;
+}): DeskSnapshot {
+  const { events, weather } = opts;
+  let warning = opts.warning ?? null;
+  const sources = new Set<string>();
+  for (const w of Object.values(weather)) {
+    for (const part of w.source.split(" \u00b7 ")) if (part) sources.add(part);
+  }
+
+  const anyDated = events.some((ev) => ensembleOk(membersForEvent(weather[ev.city.id], ev.eventDate)));
+  if (events.length && !anyDated) {
+    const hasAny = Object.values(weather).some(weatherHasDatedEnsemble);
+    const msg = hasAny
+      ? "Open-Meteo ensemble has no members for event dates (need >=8)"
+      : ENSEMBLE_UNAVAILABLE;
+    warning = warning ? `${warning} \u00b7 ${msg}` : msg;
   }
 
   const deskEvents: DeskEvent[] = [];
@@ -40,9 +73,9 @@ export async function buildDeskSnapshot(): Promise<DeskSnapshot> {
     const members = membersForEvent(wx, ev.eventDate);
     const enough = ensembleOk(members);
     const isLiveDay = wx?.localDate === ev.eventDate;
+    const dayEnded = Boolean(wx?.localDate && wx.localDate > ev.eventDate);
     const observedC = isLiveDay ? (wx?.observedMaxC ?? null) : null;
     const buckets: MarketBucket[] = ev.markets.map((m) => {
-      // Empty / thin ensemble must NOT price modelP=0 (that mints fake NO edges).
       const modelPRaw = enough
         ? bucketProbability(members, m.bound.lo, m.bound.hi, ev.unit, ev.eventDate, observedC)
         : 0;
@@ -55,8 +88,11 @@ export async function buildDeskSnapshot(): Promise<DeskSnapshot> {
       const edgeNo = enough ? 1 - modelP - m.noPrice : 0;
       const tradeable =
         enough &&
+        !dayEnded &&
         m.yesPrice >= MIN_TRADE_PRICE &&
         m.yesPrice <= MAX_TRADE_PRICE &&
+        m.yesPrice < SETTLED_PRICE &&
+        m.noPrice < SETTLED_PRICE &&
         (Math.abs(edgeYes) >= MIN_EDGE || Math.abs(edgeNo) >= MIN_EDGE);
       return {
         marketId: String(m.id),
@@ -120,8 +156,7 @@ export async function buildDeskSnapshot(): Promise<DeskSnapshot> {
       bestSignal: null,
     };
 
-    // Quant: no signals from thin/empty ensembles (members=[] => zero fills).
-    if (enough && !warning) {
+    if (enough && !warning && !dayEnded) {
       for (const b of buckets) {
         const spreadOk = b.spread == null || (Number.isFinite(b.spread) && b.spread <= MAX_SPREAD);
         if (!spreadOk) continue;
@@ -131,6 +166,7 @@ export async function buildDeskSnapshot(): Promise<DeskSnapshot> {
           b.edgeYes >= MIN_EDGE &&
           b.yesPrice >= MIN_TRADE_PRICE &&
           b.yesPrice <= MAX_TRADE_PRICE &&
+          b.yesPrice < SETTLED_PRICE &&
           b.modelP > 0.05 &&
           b.modelP < 0.95
         ) {
@@ -157,6 +193,7 @@ export async function buildDeskSnapshot(): Promise<DeskSnapshot> {
           b.edgeNo >= MIN_EDGE &&
           b.noPrice >= MIN_TRADE_PRICE &&
           b.noPrice <= MAX_TRADE_PRICE &&
+          b.noPrice < SETTLED_PRICE &&
           noModel > 0.05 &&
           noModel < 0.95
         ) {
@@ -193,7 +230,6 @@ export async function buildDeskSnapshot(): Promise<DeskSnapshot> {
   deskEvents.sort((a, b) => b.volume24hr - a.volume24hr);
 
   for (const w of Object.values(weather)) {
-    w.membersByDate = {};
     w.hourly = w.hourly.slice(0, 24);
   }
 
@@ -211,12 +247,4 @@ export async function buildDeskSnapshot(): Promise<DeskSnapshot> {
     sources: [...sources],
     warning,
   };
-}
-
-function membersForEvent(wx: WeatherNow | undefined, eventDate: string) {
-  if (!wx) return [];
-  const dated = wx.membersByDate?.[eventDate];
-  if (dated?.length) return dated;
-  if (wx.localDate === eventDate && wx.membersC?.length) return wx.membersC;
-  return [];
 }
