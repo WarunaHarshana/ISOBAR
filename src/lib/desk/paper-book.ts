@@ -11,13 +11,26 @@ export type PaperBook = {
   filledLastTick: number;
 };
 
+/** Quant freeze — keep worker + UI floors identical. */
+export const PAPER_MIN_EDGE = 0.06;
+export const PAPER_MIN_PRICE = 0.05;
+export const PAPER_MAX_PRICE = 0.85;
+export const PAPER_KELLY = 0.12;
+export const PAPER_MAX_POS = 0.08;
+export const PAPER_MAX_FILLS_PER_TICK = 4;
+export const PAPER_MAX_OPEN = 8;
+export const PAPER_MAX_OPEN_PER_EVENT = 1;
+export const PAPER_MAX_OPEN_PER_CITY_DATE = 2;
+export const PAPER_MIN_STAKE = 5;
+export const PAPER_LOG_LIMIT = 80;
+
 const defaults: BotSettings = {
   bankroll: 10_000,
-  kellyFraction: 0.12,
-  minEdge: 0.06,
-  minPrice: 0.05,
-  maxPrice: 0.85,
-  maxPosPct: 0.08,
+  kellyFraction: PAPER_KELLY,
+  minEdge: PAPER_MIN_EDGE,
+  minPrice: PAPER_MIN_PRICE,
+  maxPrice: PAPER_MAX_PRICE,
+  maxPosPct: PAPER_MAX_POS,
   armed: false,
 };
 
@@ -39,6 +52,27 @@ export function emptyBook(): PaperBook {
   };
 }
 
+/** Refuse to arm if anything looks like a live-trading unlock. */
+export function liveTradingLocked(): string | null {
+  if (process.env.ISOBAR_LIVE === "true" || process.env.ISOBAR_LIVE === "1") {
+    return "ISOBAR_LIVE is set — refusing paper arm";
+  }
+  const keyLike = [
+    "POLYMARKET_PRIVATE_KEY",
+    "PK",
+    "PRIVATE_KEY",
+    "CLOB_API_KEY",
+    "CLOB_SECRET",
+    "CLOB_PASS_PHRASE",
+  ];
+  for (const name of keyLike) {
+    if (process.env[name] && String(process.env[name]).trim()) {
+      return `${name} is set — refusing paper arm`;
+    }
+  }
+  return null;
+}
+
 export function loadPaperBook(): PaperBook {
   if (book) return book;
   const path = dataPath();
@@ -51,14 +85,19 @@ export function loadPaperBook(): PaperBook {
         settings: { ...defaults, ...(raw.settings ?? {}) },
         fills: Array.isArray(raw.fills) ? raw.fills : [],
       };
+      book.settings.minEdge = PAPER_MIN_EDGE;
+      book.settings.minPrice = PAPER_MIN_PRICE;
+      book.settings.maxPrice = PAPER_MAX_PRICE;
+      book.settings.kellyFraction = PAPER_KELLY;
+      book.settings.maxPosPct = PAPER_MAX_POS;
+      if (liveTradingLocked()) book.settings.armed = false;
       return book;
     }
   } catch (err) {
     console.error("[isobar] failed to load paper book", err);
   }
   book = emptyBook();
-  // Honor env arm for headless 24/7 without opening the UI.
-  if (process.env.ISOBAR_PAPER_ARMED === "true") {
+  if (process.env.ISOBAR_PAPER_ARMED === "true" && !liveTradingLocked()) {
     book.settings.armed = true;
   }
   return book;
@@ -85,11 +124,35 @@ export function realizedPnl(fills: PaperFill[]) {
   return { closed, openCost };
 }
 
+/** Cash available for new risk: bankroll + closed PnL − open cost. */
+export function availableCash(current: PaperBook = loadPaperBook()) {
+  const { closed, openCost } = realizedPnl(current.fills);
+  return current.settings.bankroll + closed - openCost;
+}
+
 export function patchSettings(patch: Partial<BotSettings>) {
   const cur = loadPaperBook();
+  const lock = liveTradingLocked();
+  if (patch.armed === true && lock) {
+    const next: PaperBook = {
+      ...cur,
+      settings: { ...cur.settings, ...patch, armed: false },
+      lastError: lock,
+    };
+    savePaperBook(next);
+    return next;
+  }
   const next: PaperBook = {
     ...cur,
-    settings: { ...cur.settings, ...patch },
+    settings: {
+      ...cur.settings,
+      ...patch,
+      minEdge: PAPER_MIN_EDGE,
+      minPrice: PAPER_MIN_PRICE,
+      maxPrice: PAPER_MAX_PRICE,
+      kellyFraction: PAPER_KELLY,
+      maxPosPct: PAPER_MAX_POS,
+    },
   };
   savePaperBook(next);
   return next;
@@ -107,17 +170,46 @@ export function resetBook() {
   return next;
 }
 
-export function paperTrade(signal: Signal, bankroll: number, current: PaperBook = loadPaperBook()): PaperFill | null {
-  const { settings, fills } = current;
-  if (fills.some((f) => f.marketId === signal.marketId && f.side === signal.side && f.status === "open")) {
-    return null;
+/** Keep every open fill, then newest closed rows up to PAPER_LOG_LIMIT. */
+export function truncateFills(fills: PaperFill[]): PaperFill[] {
+  const open = fills.filter((f) => f.status === "open");
+  const closed = fills.filter((f) => f.status !== "open");
+  const room = Math.max(0, PAPER_LOG_LIMIT - open.length);
+  return [...open, ...closed.slice(0, room)];
+}
+
+function fillPrice(signal: Signal, ask: number | null | undefined) {
+  if (ask != null && Number.isFinite(ask) && ask > 0) {
+    return Math.max(signal.marketP, ask);
   }
-  if (signal.edge < settings.minEdge) return null;
-  if (signal.marketP < settings.minPrice || signal.marketP > settings.maxPrice) return null;
-  const f = signal.kelly * settings.kellyFraction;
-  const cap = settings.maxPosPct;
-  const stake = Math.max(5, Math.min(bankroll * Math.min(f, cap), bankroll * cap));
-  const shares = stake / signal.marketP;
+  return signal.marketP;
+}
+
+export function paperTrade(
+  signal: Signal,
+  current: PaperBook = loadPaperBook(),
+  ask?: number | null,
+): PaperFill | null {
+  const { fills } = current;
+  if (liveTradingLocked()) return null;
+
+  const open = fills.filter((f) => f.status === "open");
+  if (open.length >= PAPER_MAX_OPEN) return null;
+  if (open.some((f) => f.marketId === signal.marketId && f.side === signal.side)) return null;
+  if (open.filter((f) => f.eventId === signal.eventId).length >= PAPER_MAX_OPEN_PER_EVENT) return null;
+  if (open.filter((f) => f.cityName === signal.cityName).length >= PAPER_MAX_OPEN_PER_CITY_DATE) return null;
+
+  if (signal.edge < PAPER_MIN_EDGE) return null;
+  const price = fillPrice(signal, ask);
+  if (price < PAPER_MIN_PRICE || price > PAPER_MAX_PRICE) return null;
+
+  const cash = availableCash(current);
+  if (cash <= 0) return null;
+  const kellyFrac = signal.kelly * PAPER_KELLY;
+  const stake = Math.min(cash * Math.min(kellyFrac, PAPER_MAX_POS), cash * PAPER_MAX_POS);
+  // Quant: if stake < $5, SKIP — do not round up.
+  if (!(stake >= PAPER_MIN_STAKE)) return null;
+  const shares = stake / price;
   return {
     id: `${signal.marketId}-${signal.side}-${Date.now()}`,
     eventId: signal.eventId,
@@ -125,7 +217,7 @@ export function paperTrade(signal: Signal, bankroll: number, current: PaperBook 
     cityName: signal.cityName,
     question: signal.question,
     side: signal.side,
-    price: signal.marketP,
+    price,
     shares,
     cost: stake,
     modelP: signal.modelP,
