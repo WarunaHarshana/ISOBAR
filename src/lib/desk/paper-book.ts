@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { BotSettings, PaperFill, Signal } from "./types";
+import type { BotSettings, PaperFill, Side, Signal } from "./types";
 
 export type PaperBook = {
   settings: BotSettings;
@@ -35,11 +35,17 @@ const defaults: BotSettings = {
 };
 
 function dataPath() {
-  const dir = process.env.ISOBAR_DATA_DIR || "/tmp/isobar";
+  // Railway volume mount; override locally with ISOBAR_DATA_DIR=/tmp/isobar
+  const dir = process.env.ISOBAR_DATA_DIR || "/data";
   return join(dir, "paper-book.json");
 }
 
 let book: PaperBook | null = null;
+
+/** Reset in-memory cache (tests). */
+export function _resetPaperBookCache() {
+  book = null;
+}
 
 export function emptyBook(): PaperBook {
   return {
@@ -64,6 +70,7 @@ export function liveTradingLocked(): string | null {
     "CLOB_API_KEY",
     "CLOB_SECRET",
     "CLOB_PASS_PHRASE",
+    "WALLET_PRIVATE_KEY",
   ];
   for (const name of keyLike) {
     if (process.env[name] && String(process.env[name]).trim()) {
@@ -178,35 +185,64 @@ export function truncateFills(fills: PaperFill[]): PaperFill[] {
   return [...open, ...closed.slice(0, room)];
 }
 
-function fillPrice(signal: Signal, ask: number | null | undefined) {
-  if (ask != null && Number.isFinite(ask) && ask > 0) {
-    return Math.max(signal.marketP, ask);
+/**
+ * Worse of mid vs ask for a buy.
+ * YES ask = bestAsk; NO ask ≈ 1 − yesBestBid.
+ */
+export function conservativeFillPrice(
+  side: Side,
+  mid: number,
+  bestBid: number | null | undefined,
+  bestAsk: number | null | undefined,
+): number {
+  if (side === "YES") {
+    if (bestAsk != null && Number.isFinite(bestAsk) && bestAsk > 0) {
+      return Math.max(mid, bestAsk);
+    }
+    return mid;
   }
-  return signal.marketP;
+  if (bestBid != null && Number.isFinite(bestBid)) {
+    const noAsk = 1 - bestBid;
+    if (noAsk > 0 && noAsk < 1) return Math.max(mid, noAsk);
+  }
+  return mid;
+}
+
+function cityDateKey(cityId: string, date: string) {
+  return `${cityId}|${date}`;
 }
 
 export function paperTrade(
   signal: Signal,
   current: PaperBook = loadPaperBook(),
-  ask?: number | null,
+  opts: { fillPrice?: number; bestBid?: number | null; bestAsk?: number | null } = {},
 ): PaperFill | null {
   const { fills } = current;
   if (liveTradingLocked()) return null;
 
   const open = fills.filter((f) => f.status === "open");
   if (open.length >= PAPER_MAX_OPEN) return null;
-  if (open.some((f) => f.marketId === signal.marketId && f.side === signal.side)) return null;
+  // No second open on same market (either side), and no YES+NO pair.
+  if (open.some((f) => f.marketId === signal.marketId)) return null;
   if (open.filter((f) => f.eventId === signal.eventId).length >= PAPER_MAX_OPEN_PER_EVENT) return null;
-  if (open.filter((f) => f.cityName === signal.cityName).length >= PAPER_MAX_OPEN_PER_CITY_DATE) return null;
+  const cd = cityDateKey(signal.cityId, signal.date);
+  if (
+    open.filter((f) => cityDateKey(f.cityId || "", f.date || "") === cd).length >=
+    PAPER_MAX_OPEN_PER_CITY_DATE
+  ) {
+    return null;
+  }
 
   if (signal.edge < PAPER_MIN_EDGE) return null;
-  const price = fillPrice(signal, ask);
+  const price =
+    opts.fillPrice ??
+    conservativeFillPrice(signal.side, signal.marketP, opts.bestBid, opts.bestAsk);
   if (price < PAPER_MIN_PRICE || price > PAPER_MAX_PRICE) return null;
 
   const cash = availableCash(current);
   if (cash <= 0) return null;
   const kellyFrac = signal.kelly * PAPER_KELLY;
-  const stake = Math.min(cash * Math.min(kellyFrac, PAPER_MAX_POS), cash * PAPER_MAX_POS);
+  const stake = cash * Math.min(kellyFrac, PAPER_MAX_POS);
   // Quant: if stake < $5, SKIP — do not round up.
   if (!(stake >= PAPER_MIN_STAKE)) return null;
   const shares = stake / price;
@@ -214,7 +250,9 @@ export function paperTrade(
     id: `${signal.marketId}-${signal.side}-${Date.now()}`,
     eventId: signal.eventId,
     marketId: signal.marketId,
+    cityId: signal.cityId,
     cityName: signal.cityName,
+    date: signal.date,
     question: signal.question,
     side: signal.side,
     price,
@@ -227,6 +265,10 @@ export function paperTrade(
   };
 }
 
+/**
+ * Apply Gamma closed+winner settlement for one market.
+ * Never call from 98¢ prints — only when Gamma reports closed + winner.
+ */
 export function settleFills(fills: PaperFill[], marketId: string, yesWon: boolean): PaperFill[] {
   return fills.map((f) => {
     if (f.marketId !== marketId || f.status !== "open") return f;
