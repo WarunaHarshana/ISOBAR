@@ -11,6 +11,11 @@ export function cached<T>(key: string, ttlMs: number, fn: () => Promise<T>): Pro
   });
 }
 
+/** Test helper — drop in-memory HTTP cache between cases. */
+export function _resetCache() {
+  store.clear();
+}
+
 export async function fetchJson<T>(url: string, init: RequestInit = {}, timeoutMs = 12_000): Promise<T> {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
