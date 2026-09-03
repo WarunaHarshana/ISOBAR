@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { _resetCache } from "./cache.ts";
-import { loadWeather } from "./weather.ts";
+import { _resetEnsembleGuards, loadWeather } from "./weather.ts";
 import type { CityMeta } from "./types.ts";
 
 const nyc: CityMeta = {
@@ -26,10 +26,21 @@ const bos: CityMeta = {
   country: "US",
 };
 
+const tokyo: CityMeta = {
+  id: "tokyo",
+  name: "Tokyo",
+  aliases: [],
+  lat: 35.6762,
+  lon: 139.6503,
+  tz: "Asia/Tokyo",
+  icao: "RJTT",
+  country: "JP",
+};
+
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
-    statusText: status === 200 ? "OK" : "ERR",
+    statusText: status === 200 ? "OK" : status === 429 ? "Too Many Requests" : "ERR",
     headers: { "content-type": "application/json" },
   });
 }
@@ -64,6 +75,7 @@ const calls: string[] = [];
 
 beforeEach(() => {
   _resetCache();
+  _resetEnsembleGuards();
   calls.length = 0;
   realFetch = globalThis.fetch;
 });
@@ -71,6 +83,7 @@ beforeEach(() => {
 afterEach(() => {
   globalThis.fetch = realFetch;
   _resetCache();
+  _resetEnsembleGuards();
 });
 
 function stubFetch(handler: (url: string) => Response | Promise<Response>) {
@@ -79,6 +92,10 @@ function stubFetch(handler: (url: string) => Response | Promise<Response>) {
     calls.push(url);
     return handler(url);
   }) as typeof fetch;
+}
+
+function ensembleCalls() {
+  return calls.filter((u) => u.includes("ensemble-api.open-meteo.com"));
 }
 
 describe("loadWeather ensemble date-key", () => {
@@ -173,5 +190,51 @@ describe("loadWeather ensemble date-key", () => {
     } finally {
       console.error = orig;
     }
+  });
+
+  it("429 on first tz-group does not fire chunk or per-city retries", async () => {
+    stubFetch((url) => {
+      if (url.includes("ensemble-api.open-meteo.com")) return jsonResponse({ error: "rate" }, 429);
+      if (url.includes("previous-runs-api.open-meteo.com")) return jsonResponse(forecastBody());
+      if (url.includes("aviationweather.gov")) return jsonResponse([]);
+      return jsonResponse({}, 404);
+    });
+    const wx = await loadWeather([nyc, tokyo]);
+    assert.equal(ensembleCalls().length, 1);
+    assert.equal(wx.nyc.membersC.length, 0);
+    assert.equal(wx.tokyo.membersC.length, 0);
+    assert.deepEqual(wx.nyc.membersByDate, {});
+    assert.equal(wx.nyc.source.includes("Open-Meteo ensemble"), false);
+  });
+
+  it("concurrent loadWeather shares one ensemble fetch", async () => {
+    const localDate = new Intl.DateTimeFormat("en-CA", { timeZone: nyc.tz }).format(new Date());
+    stubFetch(async (url) => {
+      if (url.includes("ensemble-api.open-meteo.com")) {
+        await new Promise((r) => setTimeout(r, 40));
+        return jsonResponse(ensembleBody([localDate], [27], 8));
+      }
+      if (url.includes("previous-runs-api.open-meteo.com")) return jsonResponse(forecastBody());
+      if (url.includes("aviationweather.gov")) return jsonResponse([]);
+      return jsonResponse({}, 404);
+    });
+    const [a, b] = await Promise.all([loadWeather([nyc]), loadWeather([nyc])]);
+    assert.equal(ensembleCalls().length, 1);
+    assert.ok(a.nyc.membersByDate[localDate]?.length >= 8);
+    assert.ok(b.nyc.membersByDate[localDate]?.length >= 8);
+  });
+
+  it("429 cooldown skips a second loadWeather HTTP burst", async () => {
+    stubFetch((url) => {
+      if (url.includes("ensemble-api.open-meteo.com")) return jsonResponse({ error: "rate" }, 429);
+      if (url.includes("previous-runs-api.open-meteo.com")) return jsonResponse(forecastBody());
+      if (url.includes("aviationweather.gov")) return jsonResponse([]);
+      return jsonResponse({}, 404);
+    });
+    await loadWeather([nyc]);
+    const first = ensembleCalls().length;
+    assert.equal(first, 1);
+    await loadWeather([nyc]);
+    assert.equal(ensembleCalls().length, first);
   });
 });

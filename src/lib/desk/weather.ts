@@ -118,9 +118,36 @@ function cityInMap(map: Map<string, EnsembleEntry>, cityId: string) {
   return false;
 }
 
+function isRateLimited(msg: string | null | undefined) {
+  return Boolean(msg && /\b429\b/.test(msg));
+}
+
+let ensembleCooldownUntil = 0;
+let lastEnsembleLoad: EnsembleLoad | null = null;
+let ensembleInflight: Promise<EnsembleLoad> | null = null;
+
+/** Test helper — drop 429 cooldown + single-flight between cases. */
+export function _resetEnsembleGuards() {
+  ensembleCooldownUntil = 0;
+  lastEnsembleLoad = null;
+  ensembleInflight = null;
+}
+
 async function loadEnsemble(cities: CityMeta[]): Promise<EnsembleLoad> {
+  if (!cities.length) return { map: new Map(), error: null };
+  if (ensembleInflight) return ensembleInflight;
+  ensembleInflight = loadEnsembleOnce(cities).finally(() => {
+    ensembleInflight = null;
+  });
+  return ensembleInflight;
+}
+
+async function loadEnsembleOnce(cities: CityMeta[]): Promise<EnsembleLoad> {
+  if (Date.now() < ensembleCooldownUntil) {
+    return lastEnsembleLoad ?? { map: new Map(), error: "ensemble rate-limited" };
+  }
+
   const map = new Map<string, EnsembleEntry>();
-  if (!cities.length) return { map, error: null };
 
   const tryBatch = async (batch: CityMeta[], timezone: string, label: string) => {
     try {
@@ -133,31 +160,56 @@ async function loadEnsemble(cities: CityMeta[]): Promise<EnsembleLoad> {
     }
   };
 
+  let rateLimited = false;
   for (const [tz, group] of groupCitiesByTimezone(cities)) {
+    if (rateLimited) break;
     const err = await tryBatch(group, tz, `tz ${tz}`);
     if (!err && group.every((c) => cityInMap(map, c.id))) continue;
+    if (isRateLimited(err)) {
+      rateLimited = true;
+      break;
+    }
     for (let i = 0; i < group.length; i += ENSEMBLE_CHUNK) {
+      if (rateLimited) break;
       const chunk = group.slice(i, i + ENSEMBLE_CHUNK);
       const missing = chunk.filter((c) => !cityInMap(map, c.id));
       if (!missing.length) continue;
       const chunkErr = await tryBatch(missing, tz, `tz ${tz} chunk`);
+      if (isRateLimited(chunkErr)) {
+        rateLimited = true;
+        break;
+      }
       if (chunkErr) {
         for (const city of missing) {
           if (cityInMap(map, city.id)) continue;
-          await tryBatch([city], tz, city.id);
+          const cityErr = await tryBatch([city], tz, city.id);
+          if (isRateLimited(cityErr)) {
+            rateLimited = true;
+            break;
+          }
         }
       }
     }
   }
 
+  if (rateLimited) {
+    ensembleCooldownUntil = Date.now() + ENSEMBLE_TTL;
+    console.error("[isobar] ensemble 429 cooldown", ENSEMBLE_TTL, "ms");
+  }
+
   const failed = cities.filter((c) => !cityInMap(map, c.id)).map((c) => c.id);
-  if (!failed.length) return { map, error: null };
-  const error =
-    failed.length === cities.length
-      ? `ensemble unavailable (${failed.join(", ")})`
-      : `ensemble missing ${failed.join(", ")}`;
-  console.error("[isobar]", error);
-  return { map, error: failed.length === cities.length ? error : null };
+  let error: string | null = null;
+  if (failed.length) {
+    error =
+      failed.length === cities.length
+        ? `ensemble unavailable (${failed.join(", ")})`
+        : `ensemble missing ${failed.join(", ")}`;
+    console.error("[isobar]", error);
+    if (failed.length !== cities.length) error = null;
+  }
+  const result: EnsembleLoad = { map, error };
+  lastEnsembleLoad = result;
+  return result;
 }
 
 export async function loadWeather(cities: CityMeta[]): Promise<Record<string, WeatherNow>> {
