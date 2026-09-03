@@ -1,9 +1,9 @@
-import { convertTemp } from "@/lib/utils";
-import { loadWeatherEvents } from "./polymarket";
-import { loadWeather } from "./weather";
-import { bucketProbability, impliedTemp, kellyFraction, mean } from "./math";
-import { PAPER_MAX_PRICE, PAPER_MIN_EDGE, PAPER_MIN_PRICE } from "./paper-book";
-import { ensembleOk } from "./ensemble";
+import { convertTemp } from "../utils.ts";
+import { loadWeatherEvents } from "./polymarket.ts";
+import { loadWeather } from "./weather.ts";
+import { bucketProbability, impliedTemp, kellyFraction, mean } from "./math.ts";
+import { PAPER_MAX_PRICE, PAPER_MIN_EDGE, PAPER_MIN_PRICE } from "./paper-book.ts";
+import { ensembleOk } from "./ensemble.ts";
 import type { DeskEvent, DeskSnapshot, MarketBucket, Signal, WeatherNow } from "./types";
 
 const MIN_TRADE_PRICE = PAPER_MIN_PRICE;
@@ -11,11 +11,18 @@ const MAX_TRADE_PRICE = PAPER_MAX_PRICE;
 const MIN_EDGE = PAPER_MIN_EDGE;
 const MAX_SPREAD = 0.15;
 
-export async function buildDeskSnapshot(): Promise<DeskSnapshot> {
+type SnapshotDeps = {
+  loadWeatherEventsFn?: typeof loadWeatherEvents;
+  loadWeatherFn?: typeof loadWeather;
+};
+
+export async function buildDeskSnapshot(deps: SnapshotDeps = {}): Promise<DeskSnapshot> {
+  const loadWeatherEventsFn = deps.loadWeatherEventsFn ?? loadWeatherEvents;
+  const loadWeatherFn = deps.loadWeatherFn ?? loadWeather;
   let events: Awaited<ReturnType<typeof loadWeatherEvents>> = [];
   let warning: string | null = null;
   try {
-    events = await loadWeatherEvents();
+    events = await loadWeatherEventsFn();
   } catch (err) {
     warning = err instanceof Error ? err.message : "Polymarket feed unavailable";
   }
@@ -23,9 +30,13 @@ export async function buildDeskSnapshot(): Promise<DeskSnapshot> {
   let weather: Record<string, WeatherNow> = {};
   const sources = new Set<string>();
   try {
-    weather = await loadWeather(cities);
+    const loaded = await loadWeatherFn(cities);
+    weather = loaded.weather;
     for (const w of Object.values(weather)) {
       for (const part of w.source.split(" · ")) if (part) sources.add(part);
+    }
+    if (loaded.ensembleError) {
+      warning = warning ? `${warning} · ${loaded.ensembleError}` : loaded.ensembleError;
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Weather feed unavailable";
@@ -191,9 +202,7 @@ export async function buildDeskSnapshot(): Promise<DeskSnapshot> {
 
   signals.sort((a, b) => b.edge - a.edge);
   deskEvents.sort((a, b) => b.volume24hr - a.volume24hr);
-
   for (const w of Object.values(weather)) {
-    w.membersByDate = {};
     w.hourly = w.hourly.slice(0, 24);
   }
 
