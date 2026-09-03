@@ -107,12 +107,12 @@ export async function tickPaperWorker(): Promise<PaperBook> {
       const nextFills = [...book.fills];
       for (const sig of snapshot.signals) {
         if (sig.edge < PAPER_MIN_EDGE) continue;
-        const bucket = snapshot.events
-          .flatMap((e) => e.buckets.map((b) => ({ b })))
-          .find(({ b }) => b.marketId === sig.marketId);
-        const ask = bucket?.b.bestAsk ?? null;
+        const bucket = snapshot.events.flatMap((e) => e.buckets).find((b) => b.marketId === sig.marketId);
         const draft = { ...book, fills: nextFills };
-        const fill = paperTrade(sig, draft, ask);
+        const fill = paperTrade(sig, draft, {
+          bestBid: bucket?.bestBid ?? null,
+          bestAsk: bucket?.bestAsk ?? null,
+        });
         if (!fill) continue;
         nextFills.unshift(fill);
         filled += 1;
