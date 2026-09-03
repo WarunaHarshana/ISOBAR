@@ -2,11 +2,12 @@ import { convertTemp } from "@/lib/utils";
 import { loadWeatherEvents } from "./polymarket";
 import { loadWeather } from "./weather";
 import { bucketProbability, impliedTemp, kellyFraction, mean } from "./math";
+import { PAPER_MAX_PRICE, PAPER_MIN_EDGE, PAPER_MIN_PRICE } from "./paper-book";
 import type { DeskEvent, DeskSnapshot, MarketBucket, Signal, WeatherNow } from "./types";
 
-const MIN_TRADE_PRICE = 0.03;
-const MAX_TRADE_PRICE = 0.92;
-const MIN_EDGE = 0.04;
+const MIN_TRADE_PRICE = PAPER_MIN_PRICE;
+const MAX_TRADE_PRICE = PAPER_MAX_PRICE;
+const MIN_EDGE = PAPER_MIN_EDGE;
 
 export async function buildDeskSnapshot(): Promise<DeskSnapshot> {
   let events: Awaited<ReturnType<typeof loadWeatherEvents>> = [];
