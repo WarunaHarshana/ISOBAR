@@ -30,7 +30,8 @@ export async function fetchJson<T>(url: string, init: RequestInit = {}, timeoutM
       },
     });
     if (!res.ok) {
-      throw new Error(`${res.status} ${res.statusText} for ${url}`);
+      const ra = res.headers.get("retry-after");
+      throw new Error(`${res.status} ${res.statusText}${ra ? ` retry-after=${ra}` : ""} for ${url}`);
     }
     return (await res.json()) as T;
   } finally {
