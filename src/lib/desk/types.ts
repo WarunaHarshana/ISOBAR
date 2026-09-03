@@ -131,7 +131,9 @@ export type PaperFill = {
   id: string;
   eventId: string;
   marketId: string;
+  cityId: string;
   cityName: string;
+  date: string;
   question: string;
   side: Side;
   price: number;
