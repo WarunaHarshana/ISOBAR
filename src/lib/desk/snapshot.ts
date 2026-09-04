@@ -2,7 +2,7 @@ import { convertTemp } from "../utils.ts";
 import { loadWeatherEvents, type ParsedEvent } from "./polymarket.ts";
 import { loadWeather } from "./weather.ts";
 import { bucketProbability, impliedTemp, kellyFraction, mean, membersNearBucket } from "./math.ts";
-import { PAPER_MAX_PRICE, PAPER_MIN_EDGE, PAPER_MIN_PRICE } from "./paper-book.ts";
+import { PAPER_MAX_PRICE, PAPER_MIN_EDGE, PAPER_MIN_PRICE, PAPER_MIN_PRICE_YES } from "./paper-book.ts";
 import { ensembleOk } from "./ensemble.ts";
 import type { DeskEvent, DeskSnapshot, MarketBucket, Signal, TempKind, WeatherNow } from "./types";
 
@@ -98,13 +98,15 @@ export function assembleDeskSnapshot(opts: {
       // P0: KDE tails are not YES support. Never mutate modelP.
       const edgeYes = enough && near ? modelP - m.yesPrice : 0;
       const edgeNo = enough ? 1 - modelP - m.noPrice : 0;
+      const yesPxOk =
+        m.yesPrice >= PAPER_MIN_PRICE_YES && m.yesPrice <= MAX_TRADE_PRICE && m.yesPrice < SETTLED_PRICE;
+      const noPxOk =
+        m.noPrice >= MIN_TRADE_PRICE && m.noPrice <= MAX_TRADE_PRICE && m.noPrice < SETTLED_PRICE;
       const tradeable =
         enough &&
         !dayEnded &&
-        m.yesPrice >= MIN_TRADE_PRICE &&
-        m.yesPrice <= MAX_TRADE_PRICE &&
-        m.yesPrice < SETTLED_PRICE &&
         m.noPrice < SETTLED_PRICE &&
+        (yesPxOk || noPxOk) &&
         (Math.abs(edgeYes) >= MIN_EDGE || Math.abs(edgeNo) >= MIN_EDGE);
       return {
         marketId: String(m.id),
@@ -176,11 +178,10 @@ export function assembleDeskSnapshot(opts: {
         const candidates: Array<Omit<Signal, "id">> = [];
         if (
           b.edgeYes >= MIN_EDGE &&
-          b.yesPrice >= MIN_TRADE_PRICE &&
+          b.yesPrice >= PAPER_MIN_PRICE_YES &&
           b.yesPrice <= MAX_TRADE_PRICE &&
           b.yesPrice < SETTLED_PRICE &&
           b.modelP > 0.05 &&
-          b.modelP < 0.95 &&
           membersNearBucket(members, b.lo, b.hi, ev.unit, ev.eventDate)
         ) {
           candidates.push({
@@ -239,7 +240,11 @@ export function assembleDeskSnapshot(opts: {
     deskEvents.push(event);
   }
 
-  signals.sort((a, b) => b.edge - a.edge);
+  // YES (winning bucket) before NO, then by edge. Worker fills in this order.
+  signals.sort((a, b) => {
+    if (a.side !== b.side) return a.side === "YES" ? -1 : 1;
+    return b.edge - a.edge;
+  });
   deskEvents.sort((a, b) => b.volume24hr - a.volume24hr);
 
   for (const w of Object.values(weather)) {

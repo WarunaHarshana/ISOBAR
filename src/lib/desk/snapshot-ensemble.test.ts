@@ -240,6 +240,48 @@ describe("assembleDeskSnapshot date-key", () => {
     assert.deepEqual(snap.weather.nyc.membersByDate["2026-09-04"], live);
   });
 
+  it("YES on the member-supported bucket is a signal and sorts before NO", () => {
+    const live = members(8, 27);
+    const snap = assembleDeskSnapshot({
+      events: [
+        event({
+          eventDate: "2026-09-04",
+          markets: [
+            {
+              id: "m-win",
+              question: "Will the highest temperature be 80°F?",
+              bound: { lo: 80, hi: 81, label: "80°F", kind: "exact" },
+              yesPrice: 0.12,
+              noPrice: 0.88,
+              tokens: [],
+            },
+            {
+              id: "m-far",
+              question: "Will the highest temperature be 110°F?",
+              bound: { lo: 110, hi: 111, label: "110°F", kind: "exact" },
+              yesPrice: 0.08,
+              noPrice: 0.2,
+              tokens: [],
+            },
+          ],
+        }),
+      ],
+      weather: {
+        nyc: wx({
+          localDate: "2026-09-04",
+          membersC: live,
+          membersByDate: { "2026-09-04": live },
+        }),
+      },
+    });
+    const yes = snap.signals.filter((s) => s.side === "YES");
+    const no = snap.signals.filter((s) => s.side === "NO");
+    assert.ok(yes.some((s) => s.marketId === "m-win"));
+    assert.equal(yes.some((s) => s.marketId === "m-far"), false);
+    assert.ok(snap.signals[0].side === "YES" || no.length === 0);
+    if (yes.length && no.length) assert.equal(snap.signals[0].side, "YES");
+  });
+
   it("P0: YES on a far bucket has no edge even if KDE tail mass > 0", () => {
     const live = members(8, 27); // ~80.6F
     const snap = assembleDeskSnapshot({

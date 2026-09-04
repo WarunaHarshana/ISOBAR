@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   PAPER_MIN_EDGE,
   PAPER_MIN_PRICE,
+  PAPER_MIN_PRICE_YES,
   PAPER_MAX_PRICE,
   PAPER_MAX_OPEN,
   PAPER_MAX_OPEN_PER_EVENT,
@@ -111,6 +112,7 @@ describe("floors", () => {
   it("matches snapshot floors", () => {
     assert.equal(PAPER_MIN_EDGE, 0.06);
     assert.equal(PAPER_MIN_PRICE, 0.05);
+    assert.equal(PAPER_MIN_PRICE_YES, 0.03);
     assert.equal(PAPER_MAX_PRICE, 0.85);
   });
 });
@@ -156,8 +158,21 @@ describe("caps", () => {
       openFill({ id: `o${i}`, marketId: `mx${i}`, eventId: `evx${i}`, cityId: `c${i}` }),
     );
     assert.equal(paperTrade(signal({ marketId: "n", eventId: "n", cityId: "n" }), { ...emptyBook(), fills }), null);
-    assert.equal(paperTrade(signal({ eventId: "ev1", marketId: "m2" }), { ...emptyBook(), fills: [openFill()] }), null);
-    assert.equal(PAPER_MAX_OPEN_PER_EVENT, 1);
+    assert.ok(paperTrade(signal({ eventId: "ev1", marketId: "m2", side: "NO" }), { ...emptyBook(), fills: [openFill()] }));
+    assert.equal(
+      paperTrade(
+        signal({ eventId: "ev1", marketId: "m3", side: "NO" }),
+        {
+          ...emptyBook(),
+          fills: [
+            openFill(),
+            openFill({ id: "f2", marketId: "m2", eventId: "ev1" }),
+          ],
+        },
+      ),
+      null,
+    );
+    assert.equal(PAPER_MAX_OPEN_PER_EVENT, 2);
     assert.equal(PAPER_MAX_OPEN_PER_CITY_DATE, 2);
     const two = {
       ...emptyBook(),
@@ -300,6 +315,27 @@ describe("predictioner gate", () => {
     });
     const members = Array.from({ length: 31 }, () => -2);
     assert.equal(paperTrade(hel, emptyBook(), { fillPrice: 0.2, members }), null);
+  });
+
+  it("YES fills at 3¢ on a supported bucket; 2¢ does not", () => {
+    const members = Array.from({ length: 31 }, () => 20);
+    assert.ok(
+      paperTrade(signal({ unit: "C", label: "20°C", side: "YES", marketP: 0.12, modelP: 0.4 }), emptyBook(), {
+        fillPrice: 0.03,
+        members,
+        lo: 20,
+        hi: 21,
+      }),
+    );
+    assert.equal(
+      paperTrade(signal({ unit: "C", label: "20°C", side: "YES", marketP: 0.12, modelP: 0.4 }), emptyBook(), {
+        fillPrice: 0.02,
+        members,
+        lo: 20,
+        hi: 21,
+      }),
+      null,
+    );
   });
 
   it("YES far from ensemble members returns null (near-certainty gate)", () => {

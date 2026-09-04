@@ -33,9 +33,10 @@ Never attach Polymarket/CLOB secrets to this service. Do not wire this to poly5m
 
 ## Caps (Quant freeze)
 
-- Min edge 6¢, price 5–85¢
+- Min edge 6¢; NO 5–85¢; YES 3–85¢ (member-supported winning bucket)
 - 0.12 Kelly, max 8% cash per fill
-- Max 4 fills/tick, 8 open, 1/event, 2/city-date
+- Max 4 fills/tick, 12 open, 2/event, 2/city-date
+- Fill YES (near-bucket) before NO so the book is not all tail shorts
 - Fill price = worse of mid vs ask
 - Skip stake under $5 (no round-up)
 - Cash = bankroll + closed − openCost

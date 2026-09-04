@@ -27,12 +27,14 @@ export type PaperTradeOpts = {
 /** Quant freeze — keep worker + UI floors identical. */
 export const PAPER_MIN_EDGE = 0.06;
 export const PAPER_MIN_PRICE = 0.05;
+/** Member-supported YES (winning bucket) may print cheaper than NO. */
+export const PAPER_MIN_PRICE_YES = 0.03;
 export const PAPER_MAX_PRICE = 0.85;
 export const PAPER_KELLY = 0.12;
 export const PAPER_MAX_POS = 0.08;
 export const PAPER_MAX_FILLS_PER_TICK = 4;
-export const PAPER_MAX_OPEN = 8;
-export const PAPER_MAX_OPEN_PER_EVENT = 1;
+export const PAPER_MAX_OPEN = 12;
+export const PAPER_MAX_OPEN_PER_EVENT = 2;
 export const PAPER_MAX_OPEN_PER_CITY_DATE = 2;
 export const PAPER_MIN_STAKE = 5;
 export const PAPER_LOG_LIMIT = 80;
@@ -336,7 +338,8 @@ export function paperTrade(
     price = conservativeFillPrice(signal.side, signal.marketP, opts.bestBid, opts.bestAsk);
   }
 
-  if (price < PAPER_MIN_PRICE || price > PAPER_MAX_PRICE) return null;
+  const minPx = signal.side === "YES" ? PAPER_MIN_PRICE_YES : PAPER_MIN_PRICE;
+  if (price < minPx || price > PAPER_MAX_PRICE) return null;
 
   // Predictioner gate — after fill price, before Kelly. Fail closed.
   const plausCtx: PlausibilityCtx = {};
