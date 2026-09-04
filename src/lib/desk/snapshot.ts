@@ -1,8 +1,14 @@
 import { convertTemp } from "../utils.ts";
 import { loadWeatherEvents, type ParsedEvent } from "./polymarket.ts";
 import { loadWeather } from "./weather.ts";
-import { bucketProbability, impliedTemp, kellyFraction, mean, membersNearBucket } from "./math.ts";
-import { PAPER_MAX_PRICE, PAPER_MIN_EDGE, PAPER_MIN_PRICE, PAPER_MIN_PRICE_YES } from "./paper-book.ts";
+import { bucketProbability, impliedTemp, kellyFraction, mean, membersNearBucket, valueInBucket } from "./math.ts";
+import {
+  PAPER_MAX_PRICE,
+  PAPER_MIN_EDGE,
+  PAPER_MIN_PRICE,
+  PAPER_MIN_PRICE_YES,
+  PAPER_NO_MAX_YES,
+} from "./paper-book.ts";
 import { ensembleOk } from "./ensemble.ts";
 import type { DeskEvent, DeskSnapshot, MarketBucket, Signal, TempKind, WeatherNow } from "./types";
 
@@ -85,6 +91,7 @@ export function assembleDeskSnapshot(opts: {
     const dayEnded = Boolean(wx?.localDate && wx.localDate > ev.eventDate);
     // Observed max only applies to daily-high. Flooring lows at observedMaxC is wrong.
     const observedC = isLiveDay && ev.kind === "high" ? (wx?.observedMaxC ?? null) : null;
+    const obsU = observedC != null ? convertTemp(observedC, ev.unit) : null;
     const buckets: MarketBucket[] = ev.markets.map((m) => {
       const modelPRaw = enough
         ? bucketProbability(members, m.bound.lo, m.bound.hi, ev.unit, ev.eventDate, observedC)
@@ -95,9 +102,12 @@ export function assembleDeskSnapshot(opts: {
         if (m.bound.hi <= obsU + 1e-6) modelP = 0;
       }
       const near = enough && membersNearBucket(members, m.bound.lo, m.bound.hi, ev.unit, ev.eventDate);
+      const obsIn = obsU != null && valueInBucket(obsU, m.bound.lo, m.bound.hi);
+      // Don't short the ensemble, a live high already in-bucket, or an 80%+ crowd YES.
+      const noOk = enough && !near && !obsIn && m.yesPrice < PAPER_NO_MAX_YES;
       // P0: KDE tails are not YES support. Never mutate modelP.
       const edgeYes = enough && near ? modelP - m.yesPrice : 0;
-      const edgeNo = enough ? 1 - modelP - m.noPrice : 0;
+      const edgeNo = noOk ? 1 - modelP - m.noPrice : 0;
       const yesPxOk =
         m.yesPrice >= PAPER_MIN_PRICE_YES && m.yesPrice <= MAX_TRADE_PRICE && m.yesPrice < SETTLED_PRICE;
       const noPxOk =
@@ -130,7 +140,7 @@ export function assembleDeskSnapshot(opts: {
         edgeYes,
         edgeNo,
         kellyYes: enough && near ? kellyFraction(modelP, m.yesPrice) : 0,
-        kellyNo: enough ? kellyFraction(1 - modelP, m.noPrice) : 0,
+        kellyNo: noOk ? kellyFraction(1 - modelP, m.noPrice) : 0,
         tradeable,
       };
     });
@@ -209,7 +219,10 @@ export function assembleDeskSnapshot(opts: {
           b.noPrice <= MAX_TRADE_PRICE &&
           b.noPrice < SETTLED_PRICE &&
           noModel > 0.05 &&
-          noModel < 0.95
+          noModel < 0.95 &&
+          !membersNearBucket(members, b.lo, b.hi, ev.unit, ev.eventDate) &&
+          !(obsU != null && valueInBucket(obsU, b.lo, b.hi)) &&
+          b.yesPrice < PAPER_NO_MAX_YES
         ) {
           candidates.push({
             eventId: event.eventId,

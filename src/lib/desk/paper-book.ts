@@ -29,6 +29,8 @@ export const PAPER_MIN_EDGE = 0.06;
 export const PAPER_MIN_PRICE = 0.05;
 /** Member-supported YES (winning bucket) may print cheaper than NO. */
 export const PAPER_MIN_PRICE_YES = 0.03;
+/** Skip NO when the crowd already has YES ≥ this (cheap shorts of 80%+ favorites). */
+export const PAPER_NO_MAX_YES = 0.8;
 export const PAPER_MAX_PRICE = 0.85;
 export const PAPER_KELLY = 0.12;
 export const PAPER_MAX_POS = 0.08;

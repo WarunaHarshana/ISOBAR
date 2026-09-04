@@ -84,6 +84,14 @@ export function membersNearBucket(
   return converted.some((m) => m >= nearLo && m <= nearHi);
 }
 
+/** Inclusive lo, exclusive hi (matches temperature buckets). */
+export function valueInBucket(v: number, lo: number, hi: number) {
+  if (!Number.isFinite(v)) return false;
+  const aboveLo = !Number.isFinite(lo) || v >= lo - 1e-6;
+  const belowHi = !Number.isFinite(hi) || v < hi;
+  return aboveLo && belowHi;
+}
+
 export function adjustMembersForObserved(members: number[], observedC: number | null) {
   if (observedC == null) return members;
   return members.map((m) => Math.max(m, observedC));

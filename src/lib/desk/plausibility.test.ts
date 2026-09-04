@@ -124,6 +124,25 @@ describe("plausibilityVeto Predictioner v1", () => {
     if (!r.ok) assert.equal(r.reason, "no ensemble support near bucket");
   });
 
+  it("NO is vetoed when members sit in the bucket or obs is already in it", () => {
+    const members = Array.from({ length: 31 }, () => 20);
+    const near = plausibilityVeto(signal({ side: "NO", unit: "C", label: "20°C" }), {
+      members,
+      lo: 20,
+      hi: 21,
+    });
+    assert.equal(near.ok, false);
+    if (!near.ok) assert.match(near.reason, /ensemble-supported/);
+    const obs = plausibilityVeto(signal({ side: "NO", unit: "C", kind: "high", label: "20°C" }), {
+      members: Array.from({ length: 31 }, () => 10),
+      observedC: 20.4,
+      lo: 20,
+      hi: 21,
+    });
+    assert.equal(obs.ok, false);
+    if (!obs.ok) assert.equal(obs.reason, "obs already in bucket");
+  });
+
   it("YES with members near explicit bucket still ok", () => {
     const r = plausibilityVeto(
       signal({

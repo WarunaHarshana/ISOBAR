@@ -7,6 +7,7 @@ import {
   PAPER_MIN_EDGE,
   PAPER_MIN_PRICE,
   PAPER_MIN_PRICE_YES,
+  PAPER_NO_MAX_YES,
   PAPER_MAX_PRICE,
   PAPER_MAX_OPEN,
   PAPER_MAX_OPEN_PER_EVENT,
@@ -113,6 +114,7 @@ describe("floors", () => {
     assert.equal(PAPER_MIN_EDGE, 0.06);
     assert.equal(PAPER_MIN_PRICE, 0.05);
     assert.equal(PAPER_MIN_PRICE_YES, 0.03);
+    assert.equal(PAPER_NO_MAX_YES, 0.8);
     assert.equal(PAPER_MAX_PRICE, 0.85);
   });
 });

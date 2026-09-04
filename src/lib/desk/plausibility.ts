@@ -1,4 +1,5 @@
-import { membersNearBucket } from "./math.ts";
+import { convertTemp } from "../utils.ts";
+import { membersNearBucket, valueInBucket } from "./math.ts";
 import type { Signal, TempUnit } from "./types";
 
 /** Predictioner v1 — paper-only plausibility gate (fail closed upstream). */
@@ -161,6 +162,25 @@ export function plausibilityVeto(signal: Signal, ctx: PlausibilityCtx = {}): Pla
     const hi = ctx.hi != null && Number.isFinite(ctx.hi) ? ctx.hi : Infinity;
     if (!membersNearBucket(ctx.members, ctx.lo, hi, unit, signal.date)) {
       return { ok: false, reason: "no ensemble support near bucket" };
+    }
+  }
+
+  // 6) NO must not short a bucket the ensemble or live high already sits in.
+  if (signal.side === "NO" && ctx.lo != null && Number.isFinite(ctx.lo)) {
+    const unit = signal.unit ?? "C";
+    const hi = ctx.hi != null && Number.isFinite(ctx.hi) ? ctx.hi : Infinity;
+    if (
+      ctx.members != null &&
+      ctx.members.length >= MIN_MEMBERS &&
+      membersNearBucket(ctx.members, ctx.lo, hi, unit, signal.date)
+    ) {
+      return { ok: false, reason: "NO shorts ensemble-supported bucket" };
+    }
+    if (signal.kind === "high" && ctx.observedC != null && Number.isFinite(ctx.observedC)) {
+      const obsU = convertTemp(ctx.observedC, unit);
+      if (valueInBucket(obsU, ctx.lo, hi)) {
+        return { ok: false, reason: "obs already in bucket" };
+      }
     }
   }
 

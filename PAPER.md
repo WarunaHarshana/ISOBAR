@@ -37,6 +37,7 @@ Never attach Polymarket/CLOB secrets to this service. Do not wire this to poly5m
 - 0.12 Kelly, max 8% cash per fill
 - Max 4 fills/tick, 12 open, 2/event, 2/city-date
 - Fill YES (near-bucket) before NO so the book is not all tail shorts
+- No NO when members sit in the bucket, live high is already in the bucket, or crowd YES ≥ 80¢
 - Fill price = worse of mid vs ask
 - Skip stake under $5 (no round-up)
 - Cash = bankroll + closed − openCost

@@ -282,6 +282,53 @@ describe("assembleDeskSnapshot date-key", () => {
     if (yes.length && no.length) assert.equal(snap.signals[0].side, "YES");
   });
 
+  it("does not emit NO on a crowd 90% YES favorite or an in-bucket live high", () => {
+    const live = members(8, 10); // ~50F, far from 80F
+    const crowd = assembleDeskSnapshot({
+      events: [
+        event({
+          eventDate: "2026-09-04",
+          markets: [
+            {
+              id: "m-fav",
+              question: "Will the highest temperature be 80°F?",
+              bound: { lo: 80, hi: 81, label: "80°F", kind: "exact" },
+              yesPrice: 0.91,
+              noPrice: 0.09,
+              tokens: [],
+            },
+          ],
+        }),
+      ],
+      weather: {
+        nyc: wx({
+          localDate: "2026-09-04",
+          observedMaxC: 12,
+          membersC: live,
+          membersByDate: { "2026-09-04": live },
+        }),
+      },
+    });
+    assert.equal(crowd.signals.some((s) => s.side === "NO"), false);
+
+    const inBucket = members(8, 27); // ~80.6F
+    const liveHigh = assembleDeskSnapshot({
+      events: [event({ eventDate: "2026-09-04" })],
+      weather: {
+        nyc: wx({
+          localDate: "2026-09-04",
+          observedMaxC: 27,
+          membersC: inBucket,
+          membersByDate: { "2026-09-04": inBucket },
+        }),
+      },
+    });
+    assert.equal(
+      liveHigh.signals.some((s) => s.side === "NO" && s.marketId === "m1"),
+      false,
+    );
+  });
+
   it("P0: YES on a far bucket has no edge even if KDE tail mass > 0", () => {
     const live = members(8, 27); // ~80.6F
     const snap = assembleDeskSnapshot({
