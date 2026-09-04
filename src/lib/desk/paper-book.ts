@@ -190,13 +190,39 @@ export type CityLedgerRow = {
   open: number;
   won: number;
   lost: number;
+  yes: number;
+  no: number;
   cost: number;
   openCost: number;
   closedPnl: number;
   markPnl: number;
 };
 
-/** Rank cities by mark-to-model PnL (closed + open expectation). */
+export type FillTicket = {
+  city: string;
+  side: PaperFill["side"];
+  date: string;
+  question: string;
+  status: PaperFill["status"];
+  price: number;
+  cost: number;
+  pnl: number;
+};
+
+export function fillTickets(fills: PaperFill[]): FillTicket[] {
+  return fills.map((f) => ({
+    city: f.cityName,
+    side: f.side,
+    date: f.date,
+    question: f.question,
+    status: f.status,
+    price: f.price,
+    cost: f.cost,
+    pnl: fillMarkPnl(f),
+  }));
+}
+
+/** Rank cities by closed PnL first, then mark-to-model. */
 export function cityLedger(fills: PaperFill[]): CityLedgerRow[] {
   const byId = new Map<string, CityLedgerRow>();
   for (const f of fills) {
@@ -209,6 +235,8 @@ export function cityLedger(fills: PaperFill[]): CityLedgerRow[] {
         open: 0,
         won: 0,
         lost: 0,
+        yes: 0,
+        no: 0,
         cost: 0,
         openCost: 0,
         closedPnl: 0,
@@ -218,6 +246,8 @@ export function cityLedger(fills: PaperFill[]): CityLedgerRow[] {
     }
     row.cost += f.cost;
     row.markPnl += fillMarkPnl(f);
+    if (f.side === "YES") row.yes += 1;
+    else row.no += 1;
     if (f.status === "open") {
       row.open += 1;
       row.openCost += f.cost;
@@ -229,7 +259,7 @@ export function cityLedger(fills: PaperFill[]): CityLedgerRow[] {
       row.closedPnl += f.payout - f.cost;
     }
   }
-  return [...byId.values()].sort((a, b) => b.markPnl - a.markPnl || b.closedPnl - a.closedPnl);
+  return [...byId.values()].sort((a, b) => b.closedPnl - a.closedPnl || b.markPnl - a.markPnl);
 }
 
 /** Cash available for new risk: bankroll + closed PnL − open cost. */

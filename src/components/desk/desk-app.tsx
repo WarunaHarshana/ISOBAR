@@ -644,7 +644,7 @@ function CityLedgerCard() {
                 <div className="min-w-0">
                   <p className="truncate">{r.cityName}</p>
                   <p className="truncate text-xs text-muted-foreground">
-                    {r.open} open · {r.won}W/{r.lost}L
+                    {r.yes} YES · {r.no} NO · {r.open} open · {r.won}W/{r.lost}L
                     {settled ? ` · ${Math.round((r.won / settled) * 100)}%` : ""}
                   </p>
                 </div>

@@ -236,6 +236,7 @@ describe("city ledger", () => {
         eventId: "e2",
         cityId: "lon",
         cityName: "London",
+        side: "NO",
         cost: 50,
         shares: 100,
         modelP: 0.2,
@@ -248,6 +249,7 @@ describe("city ledger", () => {
         eventId: "e3",
         cityId: "lon",
         cityName: "London",
+        side: "NO",
         cost: 40,
         shares: 80,
         modelP: 1,
@@ -259,11 +261,13 @@ describe("city ledger", () => {
     const rows = cityLedger(fills);
     assert.equal(rows[0].cityName, "Taipei");
     assert.equal(rows[0].open, 1);
+    assert.equal(rows[0].yes, 1);
     assert.ok(Math.abs(rows[0].markPnl - 60) < 1e-9);
     const lon = rows.find((r) => r.cityId === "lon");
     assert.ok(lon);
     assert.equal(lon!.won, 1);
     assert.equal(lon!.lost, 1);
+    assert.equal(lon!.no, 2);
     assert.equal(lon!.closedPnl, 80 - 40 - 50);
   });
 });
