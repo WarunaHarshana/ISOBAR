@@ -52,14 +52,33 @@ type EnsembleGlobals = {
   __isobarEnsInflight?: Promise<EnsembleLoad> | null;
   __isobarEnsNegUntil?: number;
   __isobarEnsNeg?: EnsembleLoad | null;
+  __isobarEnsLastGood?: EnsembleLoad | null;
+  __isobarEnsBackoffMs?: number;
 };
 
 const ENSEMBLE_CHUNK = 8;
 const ENSEMBLE_TTL = 8 * 60_000;
 const ENSEMBLE_TIMEOUT_MS = 20_000;
-const ENSEMBLE_NEG_MS = 120_000;
+/** First 429 cooldown. Railway datacenter IPs stay blocked at 2 min. */
+const ENSEMBLE_NEG_MS = 15 * 60_000;
+const ENSEMBLE_NEG_MAX_MS = 30 * 60_000;
 const ENSEMBLE_TZ_GAP_MS = 250;
 const ENSEMBLE_TRANSIENT_RETRY_MS = 1_000;
+
+/** Free ensemble host, or customer host when OPEN_METEO_API_KEY is set. */
+export function ensembleRequestUrl(lats: string, lons: string, timezone: string) {
+  const key = process.env.OPEN_METEO_API_KEY?.trim();
+  const host = key ? "https://customer-ensemble-api.open-meteo.com" : "https://ensemble-api.open-meteo.com";
+  const q = new URLSearchParams({
+    latitude: lats,
+    longitude: lons,
+    daily: "temperature_2m_max,temperature_2m_min",
+    forecast_days: "4",
+    timezone,
+  });
+  if (key) q.set("apikey", key);
+  return `${host}/v1/ensemble?${q.toString()}`;
+}
 
 function g(): EnsembleGlobals {
   return globalThis as EnsembleGlobals;
@@ -122,8 +141,7 @@ async function fetchEnsembleBatch(cities: CityMeta[], timezone: string) {
   if (!cities.length) return new Map<string, EnsembleEntry>();
   const lats = cities.map((c) => c.lat.toFixed(4)).join(",");
   const lons = cities.map((c) => c.lon.toFixed(4)).join(",");
-  const tz = encodeURIComponent(timezone);
-  const url = `https://ensemble-api.open-meteo.com/v1/ensemble?latitude=${lats}&longitude=${lons}&daily=temperature_2m_max,temperature_2m_min&forecast_days=4&timezone=${tz}`;
+  const url = ensembleRequestUrl(lats, lons, timezone);
   const cacheKey = `ens:tz:${timezone}:${cities.map((c) => c.id).join(",")}`;
   const raw = await cached(cacheKey, ENSEMBLE_TTL, () =>
     fetchJson<EnsembleResult | EnsembleResult[]>(url, {}, ENSEMBLE_TIMEOUT_MS),
@@ -167,10 +185,25 @@ function retryAfterMs(msg: string | null | undefined) {
 }
 
 function setNegativeCache(msg: string | null | undefined): EnsembleLoad {
-  const neg: EnsembleLoad = { map: new Map(), error: "ensemble rate-limited" };
-  g().__isobarEnsNeg = neg;
-  g().__isobarEnsNegUntil = Date.now() + retryAfterMs(msg);
-  console.error("[isobar] ensemble 429/403 negative cache", retryAfterMs(msg), "ms");
+  const glob = g();
+  const headerWait = retryAfterMs(msg);
+  const backoff = glob.__isobarEnsBackoffMs || ENSEMBLE_NEG_MS;
+  const wait = Math.min(Math.max(headerWait, backoff), ENSEMBLE_NEG_MAX_MS);
+  glob.__isobarEnsBackoffMs = Math.min(Math.max(wait * 2, ENSEMBLE_NEG_MS), ENSEMBLE_NEG_MAX_MS);
+  const last = glob.__isobarEnsLastGood;
+  const hasStale = Boolean(last && last.map.size);
+  const neg: EnsembleLoad = {
+    map: hasStale ? last!.map : new Map(),
+    error: hasStale ? null : "ensemble rate-limited",
+  };
+  glob.__isobarEnsNeg = neg;
+  glob.__isobarEnsNegUntil = Date.now() + wait;
+  console.error(
+    "[isobar] ensemble 429/403 negative cache",
+    wait,
+    "ms",
+    hasStale ? "keeping last-good" : "empty",
+  );
   return neg;
 }
 
@@ -180,6 +213,8 @@ export function _resetEnsembleGuards() {
   glob.__isobarEnsInflight = null;
   glob.__isobarEnsNegUntil = 0;
   glob.__isobarEnsNeg = null;
+  glob.__isobarEnsLastGood = null;
+  glob.__isobarEnsBackoffMs = 0;
 }
 
 async function loadEnsemble(cities: CityMeta[]): Promise<EnsembleLoad> {
@@ -264,7 +299,13 @@ async function loadEnsembleOnce(cities: CityMeta[]): Promise<EnsembleLoad> {
     console.error("[isobar]", error);
     if (failed.length !== cities.length) error = null;
   }
-  return { map, error };
+  const result: EnsembleLoad = { map, error };
+  if (map.size) {
+    const glob = g();
+    glob.__isobarEnsLastGood = result;
+    glob.__isobarEnsBackoffMs = ENSEMBLE_NEG_MS;
+  }
+  return result;
 }
 
 export async function loadWeather(cities: CityMeta[]): Promise<Record<string, WeatherNow>> {

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { _resetCache } from "./cache.ts";
-import { _resetEnsembleGuards, loadWeather } from "./weather.ts";
+import { _resetEnsembleGuards, ensembleRequestUrl, loadWeather } from "./weather.ts";
 import type { CityMeta } from "./types.ts";
 
 const nyc: CityMeta = {
@@ -245,5 +245,46 @@ describe("loadWeather ensemble date-key", () => {
     assert.equal(first, 1);
     await loadWeather([nyc]);
     assert.equal(ensembleCalls().length, first);
+  });
+
+  it("OPEN_METEO_API_KEY uses customer ensemble host", () => {
+    const prev = process.env.OPEN_METEO_API_KEY;
+    process.env.OPEN_METEO_API_KEY = "test-key";
+    try {
+      const url = ensembleRequestUrl("40.78", "-73.96", "America/New_York");
+      assert.ok(url.startsWith("https://customer-ensemble-api.open-meteo.com/v1/ensemble?"));
+      assert.ok(url.includes("apikey=test-key"));
+      assert.equal(url.includes("://ensemble-api.open-meteo.com"), false);
+    } finally {
+      if (prev === undefined) delete process.env.OPEN_METEO_API_KEY;
+      else process.env.OPEN_METEO_API_KEY = prev;
+    }
+    const free = ensembleRequestUrl("40.78", "-73.96", "America/New_York");
+    assert.ok(free.startsWith("https://ensemble-api.open-meteo.com/v1/ensemble?"));
+    assert.equal(free.includes("apikey="), false);
+  });
+
+  it("429 after a success keeps last-good members", async () => {
+    const localDate = new Intl.DateTimeFormat("en-CA", { timeZone: nyc.tz }).format(new Date());
+    stubFetch((url) => {
+      if (url.includes("ensemble-api.open-meteo.com")) {
+        return jsonResponse(ensembleBody([localDate], [27], 8));
+      }
+      if (url.includes("previous-runs-api.open-meteo.com")) return jsonResponse(forecastBody());
+      if (url.includes("aviationweather.gov")) return jsonResponse([]);
+      return jsonResponse({}, 404);
+    });
+    const ok = await loadWeather([nyc]);
+    assert.ok(ok.nyc.membersByDate[localDate]?.length >= 8);
+    _resetCache();
+    stubFetch((url) => {
+      if (url.includes("ensemble-api.open-meteo.com")) return jsonResponse({ error: "rate" }, 429);
+      if (url.includes("previous-runs-api.open-meteo.com")) return jsonResponse(forecastBody());
+      if (url.includes("aviationweather.gov")) return jsonResponse([]);
+      return jsonResponse({}, 404);
+    });
+    const stale = await loadWeather([nyc]);
+    assert.ok(stale.nyc.membersByDate[localDate]?.length >= 8);
+    assert.ok(stale.nyc.source.includes("Open-Meteo ensemble"));
   });
 });

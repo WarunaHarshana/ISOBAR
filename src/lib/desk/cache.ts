@@ -31,7 +31,8 @@ export async function fetchJson<T>(url: string, init: RequestInit = {}, timeoutM
     });
     if (!res.ok) {
       const ra = res.headers.get("retry-after");
-      throw new Error(`${res.status} ${res.statusText}${ra ? ` retry-after=${ra}` : ""} for ${url}`);
+      const safeUrl = url.replace(/([?&]apikey=)[^&]*/gi, "$1***");
+      throw new Error(`${res.status} ${res.statusText}${ra ? ` retry-after=${ra}` : ""} for ${safeUrl}`);
     }
     return (await res.json()) as T;
   } finally {

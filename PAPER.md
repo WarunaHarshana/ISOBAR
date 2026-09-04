@@ -23,6 +23,7 @@ The desk UI polls `getPaperBookFn` on a short interval (see `usePaperBookQuery` 
 | `ISOBAR_PAPER_ARMED` | Headless arm on empty book (`true`/`false`) |
 | `VITE_AUTH_ENABLED` | Keep `false` for the desk |
 | `ISOBAR_LIVE` / private keys | If set, worker **refuses to arm** |
+| `OPEN_METEO_API_KEY` | Paid Open-Meteo key. Routes ensemble to `customer-ensemble-api`. Needed on Railway — the free host 429s shared datacenter IPs |
 
 Never attach Polymarket/CLOB secrets to this service. Do not wire this to poly5m / poly15m live services.
 
