@@ -1,5 +1,5 @@
 import { fetchJson } from "./cache";
-import { buildDeskSnapshot } from "./snapshot";
+import { buildDeskSnapshot, membersForEvent } from "./snapshot";
 import type { PaperFill } from "./types";
 import {
   PAPER_MAX_FILLS_PER_TICK,
@@ -132,8 +132,8 @@ export async function tickPaperWorker(): Promise<PaperBook> {
         if (sig.edge < PAPER_MIN_EDGE) continue;
         const bucket = snapshot.events.flatMap((e) => e.buckets).find((b) => b.marketId === sig.marketId);
         const wx = snapshot.weather[sig.cityId];
-        // Quant: members only from membersByDate[eventDate]. Never membersC (wrong-day).
-        const members = wx?.membersByDate?.[sig.date];
+        // Quant: dated members by kind (max for high, min for low). Never membersC.
+        const members = membersForEvent(wx, sig.date, sig.kind);
         const draft = { ...book, fills: nextFills };
         const fill = paperTrade(sig, draft, {
           bestBid: bucket?.bestBid ?? null,
