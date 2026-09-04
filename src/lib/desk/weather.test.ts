@@ -47,12 +47,17 @@ function jsonResponse(body: unknown, status = 200) {
 
 function ensembleBody(dates: string[], valuesByDate: number[], n = 8) {
   const daily: Record<string, Array<number | string | null>> = { time: dates };
-  const series = (base: number) => dates.map((_, i) => valuesByDate[i] ?? base);
-  daily.temperature_2m_max = series(valuesByDate[0] ?? 20);
+  const maxAt = (i: number) => valuesByDate[i] ?? valuesByDate[0] ?? 20;
+  const maxSeries = (offset: number) => dates.map((_, i) => maxAt(i) + offset);
+  const minSeries = (offset: number) => dates.map((_, i) => maxAt(i) - 8 + offset);
+  daily.temperature_2m_max = maxSeries(0);
   for (let i = 1; i < n; i++) {
-    daily[`temperature_2m_max_member${String(i).padStart(2, "0")}`] = series((valuesByDate[0] ?? 20) + i * 0.01);
+    daily[`temperature_2m_max_member${String(i).padStart(2, "0")}`] = maxSeries(i * 0.01);
   }
-  daily.temperature_2m_min = series((valuesByDate[0] ?? 20) - 8);
+  daily.temperature_2m_min = minSeries(0);
+  for (let i = 1; i < n; i++) {
+    daily[`temperature_2m_min_member${String(i).padStart(2, "0")}`] = minSeries(i * 0.01);
+  }
   return { latitude: nyc.lat, longitude: nyc.lon, daily };
 }
 
@@ -119,6 +124,10 @@ describe("loadWeather ensemble date-key", () => {
     assert.ok(wx.nyc.membersByDate[localDate]?.length >= 8);
     assert.ok(wx.nyc.membersByDate[next]?.length >= 8);
     assert.equal(wx.nyc.membersC.length, wx.nyc.membersByDate[localDate].length);
+    assert.ok(wx.nyc.membersMinByDate[localDate]?.length >= 8);
+    assert.ok(
+      Math.max(...wx.nyc.membersMinByDate[localDate]) < Math.min(...wx.nyc.membersByDate[localDate]),
+    );
   });
 
   it("wrong-day fallback blocked: missing localDate does not use dates[0]", async () => {

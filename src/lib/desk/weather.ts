@@ -1,6 +1,6 @@
 import type { CityMeta, HourPoint, WeatherNow } from "./types";
-import { cached, fetchJson } from "./cache";
-import { mean, stdev } from "./math";
+import { cached, fetchJson } from "./cache.ts";
+import { mean, stdev } from "./math.ts";
 
 type EnsembleResult = {
   latitude: number;
@@ -41,7 +41,7 @@ type Metar = {
   name?: string;
 };
 
-type EnsembleEntry = { members: number[]; dates: string[] };
+type EnsembleEntry = { max: number[]; min: number[]; dates: string[] };
 
 type EnsembleLoad = {
   map: Map<string, EnsembleEntry>;
@@ -73,10 +73,14 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function memberValues(daily: Record<string, Array<number | string | null>>, dayIndex: number) {
+function memberValues(
+  daily: Record<string, Array<number | string | null>>,
+  dayIndex: number,
+  prefix: "temperature_2m_max" | "temperature_2m_min",
+) {
   const out: number[] = [];
   for (const [key, series] of Object.entries(daily)) {
-    if (!key.startsWith("temperature_2m_max")) continue;
+    if (!key.startsWith(prefix)) continue;
     const v = series[dayIndex];
     if (typeof v === "number" && Number.isFinite(v)) out.push(v);
   }
@@ -104,7 +108,11 @@ function parseEnsemble(raw: EnsembleResult | EnsembleResult[], cities: CityMeta[
     if (!row.daily) continue;
     const dates = (row.daily.time ?? []).map(String);
     for (let d = 0; d < dates.length; d++) {
-      map.set(`${city.id}:${dates[d]}`, { members: memberValues(row.daily, d), dates });
+      map.set(`${city.id}:${dates[d]}`, {
+        max: memberValues(row.daily, d, "temperature_2m_max"),
+        min: memberValues(row.daily, d, "temperature_2m_min"),
+        dates,
+      });
     }
   }
   return map;
@@ -303,16 +311,21 @@ export async function loadWeather(cities: CityMeta[]): Promise<Record<string, We
       .filter((n): n is number => n != null)
       .reduce((a, b) => Math.max(a, b), -Infinity);
     const membersByDate: Record<string, number[]> = {};
+    const membersMinByDate: Record<string, number[]> = {};
     const prefix = `${city.id}:`;
     for (const [key, val] of ensemble.map.entries()) {
       if (key.startsWith(prefix)) {
-        membersByDate[key.slice(prefix.length)] = val.members;
+        const date = key.slice(prefix.length);
+        membersByDate[date] = val.max;
+        membersMinByDate[date] = val.min;
       }
     }
     const localDate = new Intl.DateTimeFormat("en-CA", { timeZone: city.tz }).format(new Date());
     // Quant: never ens.members / dates[0] fallback.
     const members = membersByDate[localDate] ?? [];
-    const hasEnsemble = Object.values(membersByDate).some((m) => m.length >= 8);
+    const hasEnsemble =
+      Object.values(membersByDate).some((m) => m.length >= 8) ||
+      Object.values(membersMinByDate).some((m) => m.length >= 8);
     const sources = [
       hasEnsemble ? "Open-Meteo ensemble" : null,
       prev ? "Open-Meteo forecast" : null,
@@ -334,6 +347,7 @@ export async function loadWeather(cities: CityMeta[]): Promise<Record<string, We
       modelMaxC: members.length ? Math.max(...members) : null,
       membersC: members,
       membersByDate,
+      membersMinByDate,
       localDate,
       hourly,
       source: sources.join(" · ") || "unavailable",

@@ -106,6 +106,41 @@ describe("plausibilityVeto Predictioner v1", () => {
     assert.equal(sig.modelP, before);
   });
 
+  it("YES with explicit lo far from members → no ensemble support near bucket", () => {
+    const r = plausibilityVeto(
+      signal({
+        unit: "C",
+        label: "40°C",
+        side: "YES",
+        modelP: 0.12,
+      }),
+      {
+        members: Array.from({ length: 31 }, () => 20),
+        lo: 40,
+        hi: 41,
+      },
+    );
+    assert.equal(r.ok, false);
+    if (!r.ok) assert.equal(r.reason, "no ensemble support near bucket");
+  });
+
+  it("YES with members near explicit bucket still ok", () => {
+    const r = plausibilityVeto(
+      signal({
+        unit: "C",
+        label: "20°C",
+        side: "YES",
+        modelP: 0.4,
+      }),
+      {
+        members: Array.from({ length: 31 }, () => 20),
+        lo: 20,
+        hi: 21,
+      },
+    );
+    assert.equal(r.ok, true);
+  });
+
   it("parseLabelTemp reads 40°C and 95°F", () => {
     assert.deepEqual(parseLabelTemp("40°C"), { value: 40, unit: "C" });
     assert.deepEqual(parseLabelTemp("95°F"), { value: 95, unit: "F" });

@@ -39,3 +39,5 @@ Never attach Polymarket/CLOB secrets to this service. Do not wire this to poly5m
 - Skip stake under $5 (no round-up)
 - Cash = bankroll + closed − openCost
 - Truncate fills log without dropping open rows
+- Daily-high uses `membersByDate`; daily-low uses `membersMinByDate`
+- YES needs at least one ensemble member within KDE bandwidth of the bucket (no KDE-tail fills)

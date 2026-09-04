@@ -1,10 +1,10 @@
-import { convertTemp } from "../utils";
-import { loadWeatherEvents, type ParsedEvent } from "./polymarket";
-import { loadWeather } from "./weather";
-import { bucketProbability, impliedTemp, kellyFraction, mean } from "./math";
-import { PAPER_MAX_PRICE, PAPER_MIN_EDGE, PAPER_MIN_PRICE } from "./paper-book";
-import { ensembleOk } from "./ensemble";
-import type { DeskEvent, DeskSnapshot, MarketBucket, Signal, WeatherNow } from "./types";
+import { convertTemp } from "../utils.ts";
+import { loadWeatherEvents, type ParsedEvent } from "./polymarket.ts";
+import { loadWeather } from "./weather.ts";
+import { bucketProbability, impliedTemp, kellyFraction, mean, membersNearBucket } from "./math.ts";
+import { PAPER_MAX_PRICE, PAPER_MIN_EDGE, PAPER_MIN_PRICE } from "./paper-book.ts";
+import { ensembleOk } from "./ensemble.ts";
+import type { DeskEvent, DeskSnapshot, MarketBucket, Signal, TempKind, WeatherNow } from "./types";
 
 const MIN_TRADE_PRICE = PAPER_MIN_PRICE;
 const MAX_TRADE_PRICE = PAPER_MAX_PRICE;
@@ -14,15 +14,22 @@ const SETTLED_PRICE = 0.98;
 
 export const ENSEMBLE_UNAVAILABLE = "Open-Meteo ensemble unavailable (need >=8 members)";
 
-/** Dated members only. Never fall back to membersC (may be another calendar day). */
-export function membersForEvent(wx: WeatherNow | undefined, eventDate: string): number[] {
-  const dated = wx?.membersByDate?.[eventDate];
+/** Dated members by kind. Never fall back to membersC (may be another calendar day). */
+export function membersForEvent(
+  wx: WeatherNow | undefined,
+  eventDate: string,
+  kind: TempKind = "high",
+): number[] {
+  const dated = kind === "low" ? wx?.membersMinByDate?.[eventDate] : wx?.membersByDate?.[eventDate];
   return Array.isArray(dated) ? dated : [];
 }
 
 function weatherHasDatedEnsemble(w: WeatherNow | undefined) {
   if (!w) return false;
-  return Object.values(w.membersByDate ?? {}).some((m) => ensembleOk(m));
+  return (
+    Object.values(w.membersByDate ?? {}).some((m) => ensembleOk(m)) ||
+    Object.values(w.membersMinByDate ?? {}).some((m) => ensembleOk(m))
+  );
 }
 
 export async function buildDeskSnapshot(): Promise<DeskSnapshot> {
@@ -56,7 +63,9 @@ export function assembleDeskSnapshot(opts: {
     for (const part of w.source.split(" \u00b7 ")) if (part) sources.add(part);
   }
 
-  const anyDated = events.some((ev) => ensembleOk(membersForEvent(weather[ev.city.id], ev.eventDate)));
+  const anyDated = events.some((ev) =>
+    ensembleOk(membersForEvent(weather[ev.city.id], ev.eventDate, ev.kind)),
+  );
   if (events.length && !anyDated) {
     const hasAny = Object.values(weather).some(weatherHasDatedEnsemble);
     const msg = hasAny
@@ -70,11 +79,12 @@ export function assembleDeskSnapshot(opts: {
 
   for (const ev of events) {
     const wx = weather[ev.city.id];
-    const members = membersForEvent(wx, ev.eventDate);
+    const members = membersForEvent(wx, ev.eventDate, ev.kind);
     const enough = ensembleOk(members);
     const isLiveDay = wx?.localDate === ev.eventDate;
     const dayEnded = Boolean(wx?.localDate && wx.localDate > ev.eventDate);
-    const observedC = isLiveDay ? (wx?.observedMaxC ?? null) : null;
+    // Observed max only applies to daily-high. Flooring lows at observedMaxC is wrong.
+    const observedC = isLiveDay && ev.kind === "high" ? (wx?.observedMaxC ?? null) : null;
     const buckets: MarketBucket[] = ev.markets.map((m) => {
       const modelPRaw = enough
         ? bucketProbability(members, m.bound.lo, m.bound.hi, ev.unit, ev.eventDate, observedC)
@@ -84,7 +94,9 @@ export function assembleDeskSnapshot(opts: {
         const obsU = convertTemp(observedC, ev.unit);
         if (m.bound.hi <= obsU + 1e-6) modelP = 0;
       }
-      const edgeYes = enough ? modelP - m.yesPrice : 0;
+      const near = enough && membersNearBucket(members, m.bound.lo, m.bound.hi, ev.unit, ev.eventDate);
+      // P0: KDE tails are not YES support. Never mutate modelP.
+      const edgeYes = enough && near ? modelP - m.yesPrice : 0;
       const edgeNo = enough ? 1 - modelP - m.noPrice : 0;
       const tradeable =
         enough &&
@@ -115,7 +127,7 @@ export function assembleDeskSnapshot(opts: {
         modelP,
         edgeYes,
         edgeNo,
-        kellyYes: enough ? kellyFraction(modelP, m.yesPrice) : 0,
+        kellyYes: enough && near ? kellyFraction(modelP, m.yesPrice) : 0,
         kellyNo: enough ? kellyFraction(1 - modelP, m.noPrice) : 0,
         tradeable,
       };
@@ -168,7 +180,8 @@ export function assembleDeskSnapshot(opts: {
           b.yesPrice <= MAX_TRADE_PRICE &&
           b.yesPrice < SETTLED_PRICE &&
           b.modelP > 0.05 &&
-          b.modelP < 0.95
+          b.modelP < 0.95 &&
+          membersNearBucket(members, b.lo, b.hi, ev.unit, ev.eventDate)
         ) {
           candidates.push({
             eventId: event.eventId,

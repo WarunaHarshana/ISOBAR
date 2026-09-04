@@ -250,4 +250,25 @@ describe("predictioner gate", () => {
     const members = Array.from({ length: 31 }, () => -2);
     assert.equal(paperTrade(hel, emptyBook(), { fillPrice: 0.2, members }), null);
   });
+
+  it("YES far from ensemble members returns null (near-certainty gate)", () => {
+    const members = Array.from({ length: 31 }, () => 20);
+    assert.equal(
+      paperTrade(signal({ unit: "C", label: "40°C", modelP: 0.12, edge: 0.07 }), emptyBook(), {
+        fillPrice: 0.4,
+        members,
+        lo: 40,
+        hi: 41,
+      }),
+      null,
+    );
+    assert.ok(
+      paperTrade(signal({ unit: "C", label: "20°C", modelP: 0.55, edge: 0.15 }), emptyBook(), {
+        fillPrice: 0.4,
+        members,
+        lo: 20,
+        hi: 21,
+      }),
+    );
+  });
 });

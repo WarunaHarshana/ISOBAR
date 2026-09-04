@@ -1,3 +1,4 @@
+import { membersNearBucket } from "./math.ts";
 import type { Signal, TempUnit } from "./types";
 
 /** Predictioner v1 — paper-only plausibility gate (fail closed upstream). */
@@ -144,6 +145,22 @@ export function plausibilityVeto(signal: Signal, ctx: PlausibilityCtx = {}): Pla
     const bucket = resolveBucket(signal, ctx);
     if (bucket && membersInBucket(ctx.members, bucket) === 0) {
       return { ok: false, reason: "modelP≈0 no members in bucket" };
+    }
+  }
+
+  // 5) YES with no ensemble member near the bucket (KDE tail is not support).
+  // Only when paper-worker/snapshot passed explicit lo — don't infer from the label.
+  if (
+    signal.side === "YES" &&
+    ctx.members != null &&
+    ctx.members.length >= MIN_MEMBERS &&
+    ctx.lo != null &&
+    Number.isFinite(ctx.lo)
+  ) {
+    const unit = signal.unit ?? "C";
+    const hi = ctx.hi != null && Number.isFinite(ctx.hi) ? ctx.hi : Infinity;
+    if (!membersNearBucket(ctx.members, ctx.lo, hi, unit, signal.date)) {
+      return { ok: false, reason: "no ensemble support near bucket" };
     }
   }
 

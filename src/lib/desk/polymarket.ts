@@ -1,6 +1,6 @@
-import { cached, fetchJson } from "./cache";
-import { parseEventTitle, parseJsonArray, parseNumber, parseBucket, detectUnit } from "./parse";
-import { resolveCity, unknownCity } from "./cities";
+import { cached, fetchJson } from "./cache.ts";
+import { parseEventTitle, parseJsonArray, parseNumber, parseBucket, detectUnit } from "./parse.ts";
+import { resolveCity, unknownCity } from "./cities.ts";
 import type { CityMeta } from "./types";
 
 export type RawMarket = {

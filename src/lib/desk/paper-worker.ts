@@ -1,5 +1,5 @@
-import { fetchJson } from "./cache";
-import { buildDeskSnapshot, membersForEvent } from "./snapshot";
+import { fetchJson } from "./cache.ts";
+import { buildDeskSnapshot, membersForEvent } from "./snapshot.ts";
 import type { PaperFill } from "./types";
 import {
   PAPER_MAX_FILLS_PER_TICK,
@@ -12,7 +12,7 @@ import {
   settleFills,
   truncateFills,
   type PaperBook,
-} from "./paper-book";
+} from "./paper-book.ts";
 
 const TICK_MS = 25_000;
 
@@ -139,7 +139,7 @@ export async function tickPaperWorker(): Promise<PaperBook> {
           bestBid: bucket?.bestBid ?? null,
           bestAsk: bucket?.bestAsk ?? null,
           members,
-          observedC: wx?.observedMaxC ?? null,
+          observedC: sig.kind === "high" ? (wx?.observedMaxC ?? null) : null,
           lo: bucket?.lo,
           hi: bucket?.hi,
         });

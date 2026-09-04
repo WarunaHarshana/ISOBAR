@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { ensembleOk } from "./ensemble.ts";
+import { membersNearBucket } from "./math.ts";
 import {
   assembleDeskSnapshot,
   ENSEMBLE_UNAVAILABLE,
@@ -40,6 +41,7 @@ function wx(over: Partial<WeatherNow> = {}): WeatherNow {
     modelMaxC: 28,
     membersC: [],
     membersByDate: {},
+    membersMinByDate: {},
     localDate: "2026-09-03",
     hourly: [],
     source: "Open-Meteo ensemble \u00b7 Open-Meteo forecast",
@@ -106,6 +108,17 @@ describe("membersForEvent date-key", () => {
       membersByDate: { "2026-09-04": members(31, 31) },
     });
     assert.deepEqual(membersForEvent(wrongDay, "2026-09-03"), []);
+  });
+
+  it("uses membersMinByDate for low and membersByDate for high", () => {
+    const weather = wx({
+      membersC: members(8, 27),
+      membersByDate: { "2026-09-04": members(8, 27) },
+      membersMinByDate: { "2026-09-04": members(8, 10) },
+    });
+    assert.deepEqual(membersForEvent(weather, "2026-09-04", "high"), members(8, 27));
+    assert.deepEqual(membersForEvent(weather, "2026-09-04", "low"), members(8, 10));
+    assert.deepEqual(membersForEvent(weather, "2026-09-05", "low"), []);
   });
 });
 
@@ -225,5 +238,106 @@ describe("assembleDeskSnapshot date-key", () => {
     assert.ok(snap.events[0].buckets[0].modelP > 0);
     assert.deepEqual(snap.weather.nyc.membersC, live);
     assert.deepEqual(snap.weather.nyc.membersByDate["2026-09-04"], live);
+  });
+
+  it("P0: YES on a far bucket has no edge even if KDE tail mass > 0", () => {
+    const live = members(8, 27); // ~80.6F
+    const snap = assembleDeskSnapshot({
+      events: [
+        event({
+          eventDate: "2026-09-04",
+          markets: [
+            {
+              id: "m-far",
+              question: "Will the highest temperature be 110°F?",
+              bound: { lo: 110, hi: 111, label: "110°F", kind: "exact" },
+              yesPrice: 0.08,
+              noPrice: 0.92,
+              tokens: [],
+            },
+          ],
+        }),
+      ],
+      weather: {
+        nyc: wx({
+          localDate: "2026-09-04",
+          membersC: live,
+          membersByDate: { "2026-09-04": live },
+        }),
+      },
+    });
+    const b = snap.events[0].buckets[0];
+    assert.equal(membersNearBucket(live, 110, 111, "F", "2026-09-04"), false);
+    assert.ok(b.modelP >= 0, "modelP is KDE mass, not mutated");
+    assert.equal(b.edgeYes, 0);
+    assert.equal(b.kellyYes, 0);
+    assert.equal(
+      snap.signals.some((s) => s.side === "YES"),
+      false,
+    );
+  });
+
+  it("P1: low markets price membersMinByDate, not daily max", () => {
+    const maxMembers = members(8, 27); // ~80.6F — far from a 50F low bucket
+    const minMembers = members(8, 10); // ~50F
+    const snap = assembleDeskSnapshot({
+      events: [
+        event({
+          kind: "low",
+          title: "Lowest temperature in NYC",
+          slug: "nyc-low",
+          eventDate: "2026-09-04",
+          markets: [
+            {
+              id: "m-low",
+              question: "Will the lowest temperature be 50°F?",
+              bound: { lo: 50, hi: 51, label: "50°F", kind: "exact" },
+              yesPrice: 0.12,
+              noPrice: 0.88,
+              tokens: [],
+            },
+          ],
+        }),
+      ],
+      weather: {
+        nyc: wx({
+          localDate: "2026-09-04",
+          membersC: maxMembers,
+          membersByDate: { "2026-09-04": maxMembers },
+          membersMinByDate: { "2026-09-04": minMembers },
+        }),
+      },
+    });
+    const b = snap.events[0].buckets[0];
+    assert.ok(b.modelP > 0.2, "10C min members should mass into 50F");
+    assert.ok(b.edgeYes > 0);
+    assert.ok(snap.signals.some((s) => s.side === "YES" && s.kind === "low"));
+    const asHigh = assembleDeskSnapshot({
+      events: [
+        event({
+          kind: "high",
+          eventDate: "2026-09-04",
+          markets: [
+            {
+              id: "m-low",
+              question: "Will the highest temperature be 50°F?",
+              bound: { lo: 50, hi: 51, label: "50°F", kind: "exact" },
+              yesPrice: 0.12,
+              noPrice: 0.88,
+              tokens: [],
+            },
+          ],
+        }),
+      ],
+      weather: {
+        nyc: wx({
+          localDate: "2026-09-04",
+          membersC: maxMembers,
+          membersByDate: { "2026-09-04": maxMembers },
+          membersMinByDate: { "2026-09-04": minMembers },
+        }),
+      },
+    });
+    assert.equal(asHigh.events[0].buckets[0].edgeYes, 0, "daily max ~81F is not near a 50F bucket");
   });
 });
