@@ -65,7 +65,10 @@ export type WeatherNow = {
   modelMinC: number | null;
   modelMaxC: number | null;
   membersC: number[];
+  /** Daily max ensemble members by local date (backward compat for high). */
   membersByDate: Record<string, number[]>;
+  /** Daily min ensemble members by local date (for low markets). */
+  membersMinByDate: Record<string, number[]>;
   localDate: string;
   hourly: HourPoint[];
   source: string;
