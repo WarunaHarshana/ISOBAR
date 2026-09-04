@@ -56,6 +56,34 @@ export function leadSigmaC(eventDate: string, now = new Date()) {
   return 0.7 + Math.min(days, 5) * 0.35;
 }
 
+/** Same bandwidth formula as bucketProbability (no KDE widen). */
+export function kdeBandwidth(membersConverted: number[], unit: TempUnit, eventDate: string) {
+  return Math.max(
+    stdev(membersConverted) * 0.45,
+    unit === "F" ? 1.1 : 0.65,
+    leadSigmaC(eventDate) * (unit === "F" ? 1.8 : 1),
+  );
+}
+
+/**
+ * True if any raw ensemble member (converted to event unit) falls in [lo−h, hi+h]
+ * with h = kdeBandwidth. Empty members → no support.
+ */
+export function membersNearBucket(
+  membersC: number[],
+  lo: number,
+  hi: number,
+  unit: TempUnit,
+  eventDate: string,
+) {
+  if (!membersC.length) return false;
+  const converted = membersC.map((c) => convertTemp(c, unit));
+  const h = kdeBandwidth(converted, unit, eventDate);
+  const nearLo = Number.isFinite(lo) ? lo - h : -Infinity;
+  const nearHi = Number.isFinite(hi) ? hi + h : Infinity;
+  return converted.some((m) => m >= nearLo && m <= nearHi);
+}
+
 export function adjustMembersForObserved(members: number[], observedC: number | null) {
   if (observedC == null) return members;
   return members.map((m) => Math.max(m, observedC));
@@ -72,7 +100,7 @@ export function bucketProbability(
   const adjusted = adjustMembersForObserved(membersC, observedC);
   if (!adjusted.length) return 0;
   const converted = adjusted.map((c) => convertTemp(c, unit));
-  const bandwidth = Math.max(stdev(converted) * 0.45, unit === "F" ? 1.1 : 0.65, leadSigmaC(eventDate) * (unit === "F" ? 1.8 : 1));
+  const bandwidth = kdeBandwidth(converted, unit, eventDate);
   let mass = kdeMass(converted, lo, hi, bandwidth);
   if (observedC != null) {
     const obs = convertTemp(observedC, unit);
