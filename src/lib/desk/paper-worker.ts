@@ -117,6 +117,14 @@ export async function tickPaperWorker(): Promise<PaperBook> {
     if (lock && book.settings.armed) {
       book = { ...book, settings: { ...book.settings, armed: false }, lastError: lock };
       savePaperBook(book);
+    } else if (
+      !book.settings.armed &&
+      process.env.ISOBAR_PAPER_ARMED === "true" &&
+      !lock
+    ) {
+      book = { ...book, settings: { ...book.settings, armed: true } };
+      savePaperBook(book);
+      console.log("[isobar] paper worker armed from ISOBAR_PAPER_ARMED");
     }
 
     const snapshot = await buildDeskSnapshot();

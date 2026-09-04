@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { _resetCache } from "./cache.ts";
-import { _resetEnsembleGuards, ensembleRequestUrl, loadWeather } from "./weather.ts";
+import { _resetEnsembleGuards, ensembleRequestUrl, loadWeather, MULTI_MODELS } from "./weather.ts";
 import type { CityMeta } from "./types.ts";
 
 const nyc: CityMeta = {
@@ -57,6 +57,15 @@ function ensembleBody(dates: string[], valuesByDate: number[], n = 8) {
   daily.temperature_2m_min = minSeries(0);
   for (let i = 1; i < n; i++) {
     daily[`temperature_2m_min_member${String(i).padStart(2, "0")}`] = minSeries(i * 0.01);
+  }
+  return { latitude: nyc.lat, longitude: nyc.lon, daily };
+}
+
+function multiModelBody(dates: string[], value = 27) {
+  const daily: Record<string, Array<number | string | null>> = { time: dates };
+  for (const model of MULTI_MODELS) {
+    daily[`temperature_2m_max_${model}`] = dates.map(() => value);
+    daily[`temperature_2m_min_${model}`] = dates.map(() => value - 8);
   }
   return { latitude: nyc.lat, longitude: nyc.lon, daily };
 }
@@ -286,5 +295,23 @@ describe("loadWeather ensemble date-key", () => {
     const stale = await loadWeather([nyc]);
     assert.ok(stale.nyc.membersByDate[localDate]?.length >= 8);
     assert.ok(stale.nyc.source.includes("Open-Meteo ensemble"));
+  });
+
+  it("ensemble 429 falls back to multi-model forecast members", async () => {
+    const localDate = new Intl.DateTimeFormat("en-CA", { timeZone: nyc.tz }).format(new Date());
+    stubFetch((url) => {
+      if (url.includes("ensemble-api.open-meteo.com")) return jsonResponse({ error: "rate" }, 429);
+      if (url.includes("api.open-meteo.com") && url.includes("models=")) {
+        return jsonResponse(multiModelBody([localDate, "2099-01-02"], 27));
+      }
+      if (url.includes("previous-runs-api.open-meteo.com")) return jsonResponse(forecastBody());
+      if (url.includes("aviationweather.gov")) return jsonResponse([]);
+      return jsonResponse({}, 404);
+    });
+    const wx = await loadWeather([nyc]);
+    assert.equal(ensembleCalls().length, 1);
+    assert.ok(wx.nyc.membersByDate[localDate]?.length >= 8);
+    assert.ok(wx.nyc.source.includes("Open-Meteo multi-model"));
+    assert.equal(wx.nyc.source.includes("Open-Meteo ensemble"), false);
   });
 });

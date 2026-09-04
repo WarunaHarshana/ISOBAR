@@ -20,10 +20,10 @@ The desk UI polls `getPaperBookFn` on a short interval (see `usePaperBookQuery` 
 | Var | Purpose |
 | --- | --- |
 | `ISOBAR_DATA_DIR` | Persistence dir. **Set to `/data` on Railway** (volume mount). Code default is `/data`. |
-| `ISOBAR_PAPER_ARMED` | Headless arm on empty book (`true`/`false`) |
+| `ISOBAR_PAPER_ARMED` | `true` re-arms the worker each tick (24/7). `false` leaves the book/UI Arm state |
 | `VITE_AUTH_ENABLED` | Keep `false` for the desk |
 | `ISOBAR_LIVE` / private keys | If set, worker **refuses to arm** |
-| `OPEN_METEO_API_KEY` | Paid Open-Meteo key. Routes ensemble to `customer-ensemble-api`. Needed on Railway — the free host 429s shared datacenter IPs |
+| `OPEN_METEO_API_KEY` | Paid Open-Meteo key. Routes ensemble to `customer-ensemble-api`. Optional — on 429 the desk falls back to 8 global models on `api.open-meteo.com` |
 
 Never attach Polymarket/CLOB secrets to this service. Do not wire this to poly5m / poly15m live services.
 
@@ -42,3 +42,4 @@ Never attach Polymarket/CLOB secrets to this service. Do not wire this to poly5m
 - Truncate fills log without dropping open rows
 - Daily-high uses `membersByDate`; daily-low uses `membersMinByDate`
 - YES needs at least one ensemble member within KDE bandwidth of the bucket (no KDE-tail fills)
+- Dedicated ensemble-api 429 → 8-model forecast fallback (ECMWF/GFS/ICON/GEM/JMA/Météo-France/UKMO/CMA). Paper-only. No live CLOB.

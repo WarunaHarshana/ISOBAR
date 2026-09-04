@@ -46,6 +46,7 @@ type EnsembleEntry = { max: number[]; min: number[]; dates: string[] };
 type EnsembleLoad = {
   map: Map<string, EnsembleEntry>;
   error: string | null;
+  source?: "ensemble" | "multimodel";
 };
 
 type EnsembleGlobals = {
@@ -64,6 +65,30 @@ const ENSEMBLE_NEG_MS = 15 * 60_000;
 const ENSEMBLE_NEG_MAX_MS = 30 * 60_000;
 const ENSEMBLE_TZ_GAP_MS = 250;
 const ENSEMBLE_TRANSIENT_RETRY_MS = 1_000;
+
+/** Global models on api.open-meteo.com — Railway can reach this host; ensemble-api 429s. */
+export const MULTI_MODELS = [
+  "ecmwf_ifs025",
+  "gfs_seamless",
+  "icon_seamless",
+  "gem_seamless",
+  "jma_seamless",
+  "meteofrance_seamless",
+  "ukmo_seamless",
+  "cma_grapes_global",
+] as const;
+
+export function multiModelRequestUrl(lats: string, lons: string, timezone: string) {
+  const q = new URLSearchParams({
+    latitude: lats,
+    longitude: lons,
+    daily: "temperature_2m_max,temperature_2m_min",
+    forecast_days: "4",
+    timezone,
+    models: MULTI_MODELS.join(","),
+  });
+  return `https://api.open-meteo.com/v1/forecast?${q.toString()}`;
+}
 
 /** Free ensemble host, or customer host when OPEN_METEO_API_KEY is set. */
 export function ensembleRequestUrl(lats: string, lons: string, timezone: string) {
@@ -143,6 +168,18 @@ async function fetchEnsembleBatch(cities: CityMeta[], timezone: string) {
   const lons = cities.map((c) => c.lon.toFixed(4)).join(",");
   const url = ensembleRequestUrl(lats, lons, timezone);
   const cacheKey = `ens:tz:${timezone}:${cities.map((c) => c.id).join(",")}`;
+  const raw = await cached(cacheKey, ENSEMBLE_TTL, () =>
+    fetchJson<EnsembleResult | EnsembleResult[]>(url, {}, ENSEMBLE_TIMEOUT_MS),
+  );
+  return parseEnsemble(raw, cities);
+}
+
+async function fetchMultiModelBatch(cities: CityMeta[], timezone: string) {
+  if (!cities.length) return new Map<string, EnsembleEntry>();
+  const lats = cities.map((c) => c.lat.toFixed(4)).join(",");
+  const lons = cities.map((c) => c.lon.toFixed(4)).join(",");
+  const url = multiModelRequestUrl(lats, lons, timezone);
+  const cacheKey = `mm:tz:${timezone}:${cities.map((c) => c.id).join(",")}`;
   const raw = await cached(cacheKey, ENSEMBLE_TTL, () =>
     fetchJson<EnsembleResult | EnsembleResult[]>(url, {}, ENSEMBLE_TIMEOUT_MS),
   );
@@ -287,7 +324,25 @@ async function loadEnsembleOnce(cities: CityMeta[]): Promise<EnsembleLoad> {
     }
   }
 
-  if (rateLimitedMsg) return setNegativeCache(rateLimitedMsg);
+  if (rateLimitedMsg || !map.size) {
+    const fallback = await loadMultiModel(cities);
+    if (fallback.map.size) {
+      rememberGood(fallback);
+      // Cool the dedicated ensemble host without wiping multi-model members.
+      const glob = g();
+      glob.__isobarEnsNeg = fallback;
+      glob.__isobarEnsNegUntil = Date.now() + (glob.__isobarEnsBackoffMs || ENSEMBLE_NEG_MS);
+      if (rateLimitedMsg) {
+        glob.__isobarEnsBackoffMs = Math.min(
+          Math.max((glob.__isobarEnsBackoffMs || ENSEMBLE_NEG_MS) * 2, ENSEMBLE_NEG_MS),
+          ENSEMBLE_NEG_MAX_MS,
+        );
+        console.warn("[isobar] ensemble 429 — using multi-model forecast members");
+      }
+      return fallback;
+    }
+    if (rateLimitedMsg) return setNegativeCache(rateLimitedMsg);
+  }
 
   const failed = cities.filter((c) => !cityInMap(map, c.id)).map((c) => c.id);
   let error: string | null = null;
@@ -299,13 +354,43 @@ async function loadEnsembleOnce(cities: CityMeta[]): Promise<EnsembleLoad> {
     console.error("[isobar]", error);
     if (failed.length !== cities.length) error = null;
   }
-  const result: EnsembleLoad = { map, error };
-  if (map.size) {
-    const glob = g();
-    glob.__isobarEnsLastGood = result;
-    glob.__isobarEnsBackoffMs = ENSEMBLE_NEG_MS;
-  }
+  const result: EnsembleLoad = { map, error, source: "ensemble" };
+  if (map.size) rememberGood(result);
   return result;
+}
+
+function rememberGood(result: EnsembleLoad) {
+  const glob = g();
+  glob.__isobarEnsLastGood = result;
+  glob.__isobarEnsBackoffMs = ENSEMBLE_NEG_MS;
+}
+
+async function loadMultiModel(cities: CityMeta[]): Promise<EnsembleLoad> {
+  const map = new Map<string, EnsembleEntry>();
+  let tzIndex = 0;
+  for (const [tz, group] of groupCitiesByTimezone(cities)) {
+    if (tzIndex > 0) await sleep(ENSEMBLE_TZ_GAP_MS);
+    tzIndex += 1;
+    try {
+      mergeEnsemble(map, await fetchMultiModelBatch(group, tz));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[isobar] multi-model tz ${tz} failed`, msg);
+      if (isRateLimited(msg)) break;
+      if (!isUriTooLong(msg)) continue;
+      for (let i = 0; i < group.length; i += ENSEMBLE_CHUNK) {
+        const chunk = group.slice(i, i + ENSEMBLE_CHUNK);
+        try {
+          mergeEnsemble(map, await fetchMultiModelBatch(chunk, tz));
+        } catch (chunkErr) {
+          const chunkMsg = chunkErr instanceof Error ? chunkErr.message : String(chunkErr);
+          console.error(`[isobar] multi-model chunk ${tz} failed`, chunkMsg);
+          if (isRateLimited(chunkMsg)) return { map, error: null, source: "multimodel" };
+        }
+      }
+    }
+  }
+  return { map, error: null, source: "multimodel" };
 }
 
 export async function loadWeather(cities: CityMeta[]): Promise<Record<string, WeatherNow>> {
@@ -368,7 +453,11 @@ export async function loadWeather(cities: CityMeta[]): Promise<Record<string, We
       Object.values(membersByDate).some((m) => m.length >= 8) ||
       Object.values(membersMinByDate).some((m) => m.length >= 8);
     const sources = [
-      hasEnsemble ? "Open-Meteo ensemble" : null,
+      hasEnsemble
+        ? ensemble.source === "multimodel"
+          ? "Open-Meteo multi-model"
+          : "Open-Meteo ensemble"
+        : null,
       prev ? "Open-Meteo forecast" : null,
       metar ? `METAR ${city.icao}` : null,
     ].filter(Boolean) as string[];
