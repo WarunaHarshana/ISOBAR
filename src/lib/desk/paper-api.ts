@@ -2,6 +2,7 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import {
   availableCash,
+  cityLedger,
   loadPaperBook,
   paperTrade,
   patchSettings,
@@ -53,6 +54,7 @@ function bookPayload() {
     equity: book.settings.bankroll + pnl.closed,
     cash: availableCash(book),
     pnl,
+    cities: cityLedger(book.fills),
   };
 }
 

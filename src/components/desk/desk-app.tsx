@@ -142,6 +142,7 @@ export function DeskApp({ initial }: { initial: DeskSnapshot }) {
           <aside className="flex flex-col gap-4">
             <BotCard />
             <SignalsCard signals={snapshot.signals} onPick={setSelected} onTrade={onTrade} />
+            <CityLedgerCard />
             <FillsCard />
           </aside>
         </div>
@@ -161,6 +162,7 @@ export function DeskApp({ initial }: { initial: DeskSnapshot }) {
             <TabsContent value="bot" className="flex flex-col gap-4">
               <BotCard />
               <SignalsCard signals={snapshot.signals} onPick={setSelected} onTrade={onTrade} />
+              <CityLedgerCard />
               <FillsCard />
             </TabsContent>
           </Tabs>
@@ -616,6 +618,46 @@ function SignalsCard({
               </Button>
             </li>
           ))
+        )}
+      </ul>
+    </div>
+  );
+}
+
+function CityLedgerCard() {
+  const paper = usePaperBookQuery();
+  const rows = paper.data?.cities ?? [];
+  return (
+    <div className="rounded-xl bg-card shadow-[var(--shadow-border)]">
+      <div className="px-4 py-3">
+        <h2 className="text-sm font-medium">Cities</h2>
+        <p className="mt-0.5 text-xs text-muted-foreground">Mark-to-model until Gamma settles. Closed PnL is the score that matters.</p>
+      </div>
+      <ul className="max-h-72 overflow-auto">
+        {rows.length === 0 ? (
+          <li className="px-4 py-6 text-sm text-muted-foreground">No city book yet. Fills will rank here.</li>
+        ) : (
+          rows.map((r) => {
+            const settled = r.won + r.lost;
+            return (
+              <li key={r.cityId} className="flex items-center justify-between gap-2 border-t border-border px-4 py-2.5 text-sm">
+                <div className="min-w-0">
+                  <p className="truncate">{r.cityName}</p>
+                  <p className="truncate text-xs text-muted-foreground">
+                    {r.open} open · {r.won}W/{r.lost}L
+                    {settled ? ` · ${Math.round((r.won / settled) * 100)}%` : ""}
+                  </p>
+                </div>
+                <div className="text-right font-mono text-xs tabular">
+                  <p className={r.markPnl >= 0 ? "text-signal" : "text-danger"}>
+                    {r.markPnl >= 0 ? "+" : ""}
+                    {formatUsd(r.markPnl, 0)}
+                  </p>
+                  <p className="text-muted-foreground">closed {formatUsd(r.closedPnl, 0)}</p>
+                </div>
+              </li>
+            );
+          })
         )}
       </ul>
     </div>

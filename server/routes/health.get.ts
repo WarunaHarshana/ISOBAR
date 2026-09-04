@@ -1,5 +1,5 @@
 import { getWorkerStatus, startPaperWorker } from "../../src/lib/desk/paper-worker";
-import { availableCash, loadPaperBook, realizedPnl } from "../../src/lib/desk/paper-book";
+import { availableCash, cityLedger, loadPaperBook, realizedPnl } from "../../src/lib/desk/paper-book";
 
 /**
  * Railway healthcheck. Plain default export — Nitro v3 in this stack does not
@@ -28,5 +28,6 @@ export default function healthHandler() {
     cash: availableCash(book),
     pnl,
     lastError: book.lastError,
+    cities: cityLedger(book.fills),
   };
 }

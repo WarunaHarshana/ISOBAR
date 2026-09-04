@@ -20,6 +20,8 @@ import {
   paperTrade,
   patchSettings,
   realizedPnl,
+  cityLedger,
+  fillMarkPnl,
   savePaperBook,
   settleFills,
   truncateFills,
@@ -197,6 +199,55 @@ describe("truncateFills", () => {
     assert.equal(trimmed.filter((f) => f.status === "open").length, 5);
     assert.ok(trimmed.length <= 80);
     assert.equal(realizedPnl([]).closed, 0);
+  });
+});
+
+describe("city ledger", () => {
+  it("ranks cities by mark-to-model including open expectation", () => {
+    const fills = [
+      openFill({
+        cityId: "tai",
+        cityName: "Taipei",
+        cost: 100,
+        shares: 200,
+        modelP: 0.8,
+        status: "open",
+      }),
+      openFill({
+        id: "f2",
+        marketId: "m2",
+        eventId: "e2",
+        cityId: "lon",
+        cityName: "London",
+        cost: 50,
+        shares: 100,
+        modelP: 0.2,
+        status: "lost",
+        payout: 0,
+      }),
+      openFill({
+        id: "f3",
+        marketId: "m3",
+        eventId: "e3",
+        cityId: "lon",
+        cityName: "London",
+        cost: 40,
+        shares: 80,
+        modelP: 1,
+        status: "won",
+        payout: 80,
+      }),
+    ];
+    assert.equal(fillMarkPnl(fills[0]), 60);
+    const rows = cityLedger(fills);
+    assert.equal(rows[0].cityName, "Taipei");
+    assert.equal(rows[0].open, 1);
+    assert.ok(Math.abs(rows[0].markPnl - 60) < 1e-9);
+    const lon = rows.find((r) => r.cityId === "lon");
+    assert.ok(lon);
+    assert.equal(lon!.won, 1);
+    assert.equal(lon!.lost, 1);
+    assert.equal(lon!.closedPnl, 80 - 40 - 50);
   });
 });
 

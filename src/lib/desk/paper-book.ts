@@ -174,6 +174,60 @@ export function realizedPnl(fills: PaperFill[]) {
   return { closed, openCost };
 }
 
+/** Mark-to-model PnL: closed uses payout; open uses shares × modelP − cost. */
+export function fillMarkPnl(fill: PaperFill): number {
+  if (fill.status === "open") return fill.shares * fill.modelP - fill.cost;
+  return fill.payout - fill.cost;
+}
+
+export type CityLedgerRow = {
+  cityId: string;
+  cityName: string;
+  open: number;
+  won: number;
+  lost: number;
+  cost: number;
+  openCost: number;
+  closedPnl: number;
+  markPnl: number;
+};
+
+/** Rank cities by mark-to-model PnL (closed + open expectation). */
+export function cityLedger(fills: PaperFill[]): CityLedgerRow[] {
+  const byId = new Map<string, CityLedgerRow>();
+  for (const f of fills) {
+    const key = f.cityId || f.cityName || "unknown";
+    let row = byId.get(key);
+    if (!row) {
+      row = {
+        cityId: f.cityId,
+        cityName: f.cityName || f.cityId,
+        open: 0,
+        won: 0,
+        lost: 0,
+        cost: 0,
+        openCost: 0,
+        closedPnl: 0,
+        markPnl: 0,
+      };
+      byId.set(key, row);
+    }
+    row.cost += f.cost;
+    row.markPnl += fillMarkPnl(f);
+    if (f.status === "open") {
+      row.open += 1;
+      row.openCost += f.cost;
+    } else if (f.status === "won") {
+      row.won += 1;
+      row.closedPnl += f.payout - f.cost;
+    } else {
+      row.lost += 1;
+      row.closedPnl += f.payout - f.cost;
+    }
+  }
+  return [...byId.values()].sort((a, b) => b.markPnl - a.markPnl || b.closedPnl - a.closedPnl);
+}
+
 /** Cash available for new risk: bankroll + closed PnL − open cost. */
 export function availableCash(current: PaperBook = loadPaperBook()) {
   const { closed, openCost } = realizedPnl(current.fills);
