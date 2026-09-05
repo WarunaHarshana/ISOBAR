@@ -84,6 +84,21 @@ export function membersNearBucket(
   return converted.some((m) => m >= nearLo && m <= nearHi);
 }
 
+export function bucketMid(lo: number, hi: number) {
+  if (Number.isFinite(lo) && Number.isFinite(hi)) return (lo + hi) / 2;
+  if (Number.isFinite(lo)) return lo + 0.5;
+  if (Number.isFinite(hi)) return hi - 0.5;
+  return 0;
+}
+
+export function noGapMin(unit: TempUnit) {
+  return unit === "F" ? 9 : 5;
+}
+
+export function yesLeadMax(unit: TempUnit) {
+  return unit === "F" ? 4.5 : 2.5;
+}
+
 /** Inclusive lo, exclusive hi (matches temperature buckets). */
 export function valueInBucket(v: number, lo: number, hi: number) {
   if (!Number.isFinite(v)) return false;

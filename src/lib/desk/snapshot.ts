@@ -1,13 +1,24 @@
 import { convertTemp } from "../utils.ts";
 import { loadWeatherEvents, type ParsedEvent } from "./polymarket.ts";
 import { loadWeather } from "./weather.ts";
-import { bucketProbability, impliedTemp, kellyFraction, mean, membersNearBucket, valueInBucket } from "./math.ts";
+import {
+  bucketMid,
+  bucketProbability,
+  impliedTemp,
+  kellyFraction,
+  mean,
+  membersNearBucket,
+  noGapMin,
+  valueInBucket,
+  yesLeadMax,
+} from "./math.ts";
 import {
   PAPER_MAX_PRICE,
   PAPER_MIN_EDGE,
   PAPER_MIN_PRICE,
   PAPER_MIN_PRICE_YES,
   PAPER_NO_MAX_YES,
+  PAPER_YES_MIN_MODELP,
 } from "./paper-book.ts";
 import { ensembleOk } from "./ensemble.ts";
 import type { DeskEvent, DeskSnapshot, MarketBucket, Signal, TempKind, WeatherNow } from "./types";
@@ -92,19 +103,23 @@ export function assembleDeskSnapshot(opts: {
     // Observed max only applies to daily-high. Flooring lows at observedMaxC is wrong.
     const observedC = isLiveDay && ev.kind === "high" ? (wx?.observedMaxC ?? null) : null;
     const obsU = observedC != null ? convertTemp(observedC, ev.unit) : null;
+    const mu = enough ? mean(members.map((m) => convertTemp(m, ev.unit))) : 0;
+    const gap = noGapMin(ev.unit);
+    const lead = yesLeadMax(ev.unit);
     const buckets: MarketBucket[] = ev.markets.map((m) => {
       const modelPRaw = enough
         ? bucketProbability(members, m.bound.lo, m.bound.hi, ev.unit, ev.eventDate, observedC)
         : 0;
       let modelP = modelPRaw;
-      if (enough && observedC != null && Number.isFinite(m.bound.hi)) {
-        const obsU = convertTemp(observedC, ev.unit);
+      if (enough && obsU != null && Number.isFinite(m.bound.hi)) {
         if (m.bound.hi <= obsU + 1e-6) modelP = 0;
       }
       const near = enough && membersNearBucket(members, m.bound.lo, m.bound.hi, ev.unit, ev.eventDate);
       const obsIn = obsU != null && valueInBucket(obsU, m.bound.lo, m.bound.hi);
-      // Don't short the ensemble, a live high already in-bucket, or an 80%+ crowd YES.
-      const noOk = enough && !near && !obsIn && m.yesPrice < PAPER_NO_MAX_YES;
+      const mid = bucketMid(m.bound.lo, m.bound.hi);
+      const far = Math.abs(mid - mu) >= gap && (obsU == null || Math.abs(mid - obsU) >= gap);
+      // Don't short the ensemble, a live high already in-bucket, an 80%+ crowd YES, or a close bucket.
+      const noOk = enough && !near && !obsIn && far && m.yesPrice < PAPER_NO_MAX_YES;
       // P0: KDE tails are not YES support. Never mutate modelP.
       const edgeYes = enough && near ? modelP - m.yesPrice : 0;
       const edgeNo = noOk ? 1 - modelP - m.noPrice : 0;
@@ -181,17 +196,28 @@ export function assembleDeskSnapshot(opts: {
     };
 
     if (enough && !warning && !dayEnded) {
+      const modalYes = buckets
+        .filter(
+          (b) =>
+            b.modelP >= PAPER_YES_MIN_MODELP &&
+            membersNearBucket(members, b.lo, b.hi, ev.unit, ev.eventDate),
+        )
+        .sort((a, b) => b.modelP - a.modelP)[0];
       for (const b of buckets) {
         const spreadOk = b.spread == null || (Number.isFinite(b.spread) && b.spread <= MAX_SPREAD);
         if (!spreadOk) continue;
 
         const candidates: Array<Omit<Signal, "id">> = [];
+        const yesLeadOk = obsU == null || !Number.isFinite(b.lo) || b.lo <= obsU + lead;
         if (
+          modalYes &&
+          b.marketId === modalYes.marketId &&
+          yesLeadOk &&
           b.edgeYes >= MIN_EDGE &&
           b.yesPrice >= PAPER_MIN_PRICE_YES &&
           b.yesPrice <= MAX_TRADE_PRICE &&
           b.yesPrice < SETTLED_PRICE &&
-          b.modelP > 0.05 &&
+          b.modelP >= PAPER_YES_MIN_MODELP &&
           membersNearBucket(members, b.lo, b.hi, ev.unit, ev.eventDate)
         ) {
           candidates.push({
@@ -219,7 +245,6 @@ export function assembleDeskSnapshot(opts: {
           b.noPrice <= MAX_TRADE_PRICE &&
           b.noPrice < SETTLED_PRICE &&
           noModel > 0.05 &&
-          noModel < 0.95 &&
           !membersNearBucket(members, b.lo, b.hi, ev.unit, ev.eventDate) &&
           !(obsU != null && valueInBucket(obsU, b.lo, b.hi)) &&
           b.yesPrice < PAPER_NO_MAX_YES

@@ -35,9 +35,10 @@ export const PAPER_MAX_PRICE = 0.85;
 export const PAPER_KELLY = 0.12;
 export const PAPER_MAX_POS = 0.08;
 export const PAPER_MAX_FILLS_PER_TICK = 4;
-export const PAPER_MAX_OPEN = 12;
-export const PAPER_MAX_OPEN_PER_EVENT = 2;
-export const PAPER_MAX_OPEN_PER_CITY_DATE = 2;
+export const PAPER_MAX_OPEN = 8;
+export const PAPER_MAX_OPEN_PER_EVENT = 1;
+export const PAPER_MAX_OPEN_PER_CITY_DATE = 1;
+export const PAPER_YES_MIN_MODELP = 0.2;
 export const PAPER_MIN_STAKE = 5;
 export const PAPER_LOG_LIMIT = 80;
 

@@ -160,22 +160,9 @@ describe("caps", () => {
       openFill({ id: `o${i}`, marketId: `mx${i}`, eventId: `evx${i}`, cityId: `c${i}` }),
     );
     assert.equal(paperTrade(signal({ marketId: "n", eventId: "n", cityId: "n" }), { ...emptyBook(), fills }), null);
-    assert.ok(paperTrade(signal({ eventId: "ev1", marketId: "m2", side: "NO" }), { ...emptyBook(), fills: [openFill()] }));
-    assert.equal(
-      paperTrade(
-        signal({ eventId: "ev1", marketId: "m3", side: "NO" }),
-        {
-          ...emptyBook(),
-          fills: [
-            openFill(),
-            openFill({ id: "f2", marketId: "m2", eventId: "ev1" }),
-          ],
-        },
-      ),
-      null,
-    );
-    assert.equal(PAPER_MAX_OPEN_PER_EVENT, 2);
-    assert.equal(PAPER_MAX_OPEN_PER_CITY_DATE, 2);
+    assert.equal(paperTrade(signal({ eventId: "ev1", marketId: "m2", side: "NO" }), { ...emptyBook(), fills: [openFill()] }), null);
+    assert.equal(PAPER_MAX_OPEN_PER_EVENT, 1);
+    assert.equal(PAPER_MAX_OPEN_PER_CITY_DATE, 1);
     const two = {
       ...emptyBook(),
       fills: [

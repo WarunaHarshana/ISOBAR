@@ -269,6 +269,7 @@ describe("assembleDeskSnapshot date-key", () => {
       weather: {
         nyc: wx({
           localDate: "2026-09-04",
+          observedMaxC: 26,
           membersC: live,
           membersByDate: { "2026-09-04": live },
         }),
@@ -280,6 +281,60 @@ describe("assembleDeskSnapshot date-key", () => {
     assert.equal(yes.some((s) => s.marketId === "m-far"), false);
     assert.ok(snap.signals[0].side === "YES" || no.length === 0);
     if (yes.length && no.length) assert.equal(snap.signals[0].side, "YES");
+    assert.equal(yes.filter((s) => s.marketId === "m-win").length, 1);
+  });
+
+  it("emits at most one YES (modal bucket) and skips close NOs", () => {
+    const live = members(8, 27); // ~80.6F
+    const snap = assembleDeskSnapshot({
+      events: [
+        event({
+          eventDate: "2026-09-04",
+          markets: [
+            {
+              id: "m-80",
+              question: "Will the highest temperature be 80°F?",
+              bound: { lo: 80, hi: 81, label: "80°F", kind: "exact" },
+              yesPrice: 0.12,
+              noPrice: 0.88,
+              tokens: [],
+            },
+            {
+              id: "m-82",
+              question: "Will the highest temperature be 82°F?",
+              bound: { lo: 82, hi: 83, label: "82°F", kind: "exact" },
+              yesPrice: 0.12,
+              noPrice: 0.2,
+              tokens: [],
+            },
+            {
+              id: "m-110",
+              question: "Will the highest temperature be 110°F?",
+              bound: { lo: 110, hi: 111, label: "110°F", kind: "exact" },
+              yesPrice: 0.2,
+              noPrice: 0.25,
+              tokens: [],
+            },
+          ],
+        }),
+      ],
+      weather: {
+        nyc: wx({
+          localDate: "2026-09-04",
+          observedMaxC: 26,
+          membersC: live,
+          membersByDate: { "2026-09-04": live },
+        }),
+      },
+    });
+    const yes = snap.signals.filter((s) => s.side === "YES");
+    assert.equal(yes.length, 1);
+    assert.equal(yes[0].marketId, "m-80");
+    assert.equal(
+      snap.signals.some((s) => s.side === "NO" && s.marketId === "m-82"),
+      false,
+    );
+    assert.ok(snap.signals.some((s) => s.side === "NO" && s.marketId === "m-110"));
   });
 
   it("does not emit NO on a crowd 90% YES favorite or an in-bucket live high", () => {
