@@ -11,7 +11,7 @@ function ScrollArea({ className, children, ...props }: React.ComponentProps<type
         orientation="vertical"
         className="flex w-2.5 touch-none select-none p-0.5"
       >
-        <ScrollAreaPrimitive.Thumb className="relative flex-1 rounded-full bg-border" />
+        <ScrollAreaPrimitive.Thumb className="relative flex-1 rounded-full bg-white/20 hover:bg-white/35 transition-colors" />
       </ScrollAreaPrimitive.Scrollbar>
     </ScrollAreaPrimitive.Root>
   );

@@ -397,12 +397,12 @@ export async function loadWeather(cities: CityMeta[]): Promise<Record<string, We
   const unique = [...new Map(cities.filter((c) => c.lat !== 0 || c.lon !== 0).map((c) => [c.id, c])).values()];
   if (!unique.length) return {};
 
-  const ensembleP = loadEnsemble(unique).then(
+  const ensembleP: Promise<EnsembleLoad> = loadEnsemble(unique).then(
     (r) => r,
-    (err) => {
+    (err): EnsembleLoad => {
       const error = err instanceof Error ? err.message : String(err);
       console.error("[isobar] ensemble fetch failed", err);
-      return { map: new Map<string, EnsembleEntry>(), error } satisfies EnsembleLoad;
+      return { map: new Map<string, EnsembleEntry>(), error };
     },
   );
 
