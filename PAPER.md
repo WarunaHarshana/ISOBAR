@@ -8,7 +8,7 @@ Production builds use Nitro **`node-server`** (see `vite.config.ts`) so `setInte
 
 The Node process boots `server/plugins/paper-worker.ts`, which runs `startPaperWorker()` on a 25s tick:
 
-1. Build desk snapshot (Open-Meteo + Gamma)
+1. Build desk snapshot (WeatherNext 3 primary, Open-Meteo ECMWF ensemble fallback, METAR + Gamma)
 2. Settle open fills only from Gamma `closed` + winner (never from 98¢ prints)
 3. If armed, Kelly paper fills with Quant caps
 4. Persist to `${ISOBAR_DATA_DIR}/paper-book.json`
@@ -23,6 +23,41 @@ The desk UI polls `getPaperBookFn` on a short interval (see `usePaperBookQuery` 
 | `ISOBAR_PAPER_ARMED` | Headless arm on empty book (`true`/`false`) |
 | `VITE_AUTH_ENABLED` | Keep `false` for the desk |
 | `ISOBAR_LIVE` / private keys | If set, worker **refuses to arm** |
+
+### WeatherNext 3 (primary forecast, optional)
+
+Unset → the desk uses the Open-Meteo ensemble exactly as before.
+
+| Var | Purpose |
+| --- | --- |
+| `ISOBAR_WEATHERNEXT_PROJECT` | GCP project that runs/pays for query jobs (e.g. `polym-509212`). Required. |
+| `ISOBAR_WEATHERNEXT_DATASET` | Linked WeatherNext dataset, `weathernext_3` or `otherproject.weathernext_3`. Required. |
+| `ISOBAR_WEATHERNEXT_CREDENTIALS_JSON` | Service-account key JSON (raw or base64). Read from env, never written to disk. Omit to use ADC / `GOOGLE_APPLICATION_CREDENTIALS`. |
+| `ISOBAR_WEATHERNEXT_TABLE` | Default `weathernext_3_0_0_0p05deg` (station-head 2 m temp). |
+| `ISOBAR_WEATHERNEXT_LOCATION` | Default `US`. |
+| `ISOBAR_WEATHERNEXT_INIT_HOURS` | UTC inits to use, default `0,12` (subset of `0,6,12,18`). |
+| `ISOBAR_WEATHERNEXT_PROBE_MIN` | Min minutes between "new init yet?" probes, default `30`. Probes only run while a due init is missing. |
+| `ISOBAR_WEATHERNEXT_MAX_HOURS` | Lead hours kept, default `120`. |
+| `ISOBAR_WEATHERNEXT_DAILY_GIB` / `ISOBAR_WEATHERNEXT_MONTHLY_GIB` | Hard byte caps, default `8` / `240` GiB. Counter persisted to `${ISOBAR_DATA_DIR}/weathernext-usage.json`. Over cap → keep last init (≤30 h) or fall back to Open-Meteo. |
+| `ISOBAR_WEATHERNEXT_DISABLED` | `true` = kill switch. |
+
+GCP setup (one time):
+
+1. Create a service account in the billing project, e.g. `isobar-weathernext@<project>.iam.gserviceaccount.com`.
+2. Grant **BigQuery Job User** (`roles/bigquery.jobUser`) on the project.
+3. Grant **BigQuery Data Viewer** (`roles/bigquery.dataViewer`) on the `weathernext_3` dataset
+   (`bq add-iam-policy-binding --member=serviceAccount:<sa> --role=roles/bigquery.dataViewer <project>:weathernext_3`, or dataset → Share in the console).
+4. Create a JSON key and paste it into Railway as `ISOBAR_WEATHERNEXT_CREDENTIALS_JSON`; set `ISOBAR_WEATHERNEXT_PROJECT` and `ISOBAR_WEATHERNEXT_DATASET`.
+
+How members are built: one batched query per init returns hourly p10/p50/p90 at the nearest 0.05° cell for every city.
+50 synthetic members use fixed normal-score ranks; each member takes the same rank every hour (comonotonic), and its
+daily max is the max over that city-local date. Under that assumption this is exactly the quantile of the daily max;
+real hour-to-hour correlation is slightly below 1, so it is a small low bias on the mean max. A local date is only
+emitted when the init covers local 11:00–23:00; otherwise that date has no members and is not traded.
+
+Cost: point lookups are pruned by geography clustering, so bytes ≈ 86 MiB per city per init (4 columns), probe 10 MiB.
+`0,12` inits × ≤40 active cities ≈ 6.7 GiB/day ≈ 200 GiB/month, capped at 8 GiB/day and 240 GiB/month (inside the
+1 TiB/month free tier). Smoke test: `scripts/weathernext-smoke.ts` (one probe + one fetch).
 
 Never attach Polymarket/CLOB secrets to this service. Do not wire this to poly5m / poly15m live services.
 

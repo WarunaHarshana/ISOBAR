@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { _resetCache } from "./cache.ts";
 import { _resetEnsembleGuards, loadWeather } from "./weather.ts";
+import { _resetWeatherNext, _setWeatherNextConfig } from "./weathernext.ts";
 import type { CityMeta } from "./types.ts";
 
 const nyc: CityMeta = {
@@ -74,6 +75,9 @@ let realFetch: typeof fetch;
 const calls: string[] = [];
 
 beforeEach(() => {
+  // Open-Meteo path tests: force WeatherNext off regardless of local env.
+  _setWeatherNextConfig(null);
+  _resetWeatherNext();
   _resetCache();
   _resetEnsembleGuards();
   calls.length = 0;
@@ -81,6 +85,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  _setWeatherNextConfig(undefined);
   globalThis.fetch = realFetch;
   _resetCache();
   _resetEnsembleGuards();

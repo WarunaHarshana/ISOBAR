@@ -12,7 +12,7 @@ const MIN_EDGE = PAPER_MIN_EDGE;
 const MAX_SPREAD = 0.15;
 const SETTLED_PRICE = 0.98;
 
-export const ENSEMBLE_UNAVAILABLE = "Open-Meteo ensemble unavailable (need >=8 members)";
+export const ENSEMBLE_UNAVAILABLE = "Forecast ensemble unavailable (WeatherNext 3 / Open-Meteo, need >=8 members)";
 
 /** Dated members only. Never fall back to membersC (may be another calendar day). */
 export function membersForEvent(wx: WeatherNow | undefined, eventDate: string): number[] {
@@ -60,7 +60,7 @@ export function assembleDeskSnapshot(opts: {
   if (events.length && !anyDated) {
     const hasAny = Object.values(weather).some(weatherHasDatedEnsemble);
     const msg = hasAny
-      ? "Open-Meteo ensemble has no members for event dates (need >=8)"
+      ? "Forecast ensemble has no members for event dates (need >=8)"
       : ENSEMBLE_UNAVAILABLE;
     warning = warning ? `${warning} \u00b7 ${msg}` : msg;
   }
