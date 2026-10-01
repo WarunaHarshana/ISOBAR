@@ -9,6 +9,8 @@ import {
   buildFetchSql,
   buildProbeSql,
   dailyMaxMembers,
+  FETCH_BATCH_SIZE,
+  probeLatestInit,
   dueInitCandidates,
   loadWeatherNext,
   memberRanks,
@@ -40,6 +42,7 @@ const cfg: WeatherNextConfig = {
   initHours: [0, 12],
   dailyCapBytes: 9 * 1024 ** 3,
   monthlyCapBytes: 270 * 1024 ** 3,
+  maxEstimateBytes: 28 * 1024 ** 3,
   usageFile: null,
 };
 
@@ -69,20 +72,42 @@ function fakeRows(cityIdx: number, init: string, base = 20): WeatherNextRow[] {
 }
 
 type Call = { sql: string };
+/** Real (billed) jobs only. */
 let calls: Call[] = [];
+/** Dry runs (free). */
+let dryCalls: Call[] = [];
 
-function runnerFor(handler: (sql: string) => WeatherNextRow[] | Promise<WeatherNextRow[]>, bytes = 90 * MIB) {
-  _setWeatherNextRunner(async (sql) => {
+const PARTITION_BYTES = 3_318_681_600; // measured dry-run size of one init's init_time column
+const isProbe = (sql: string) => /^SELECT init_time FROM .* WHERE init_time = TIMESTAMP/.test(sql);
+const sqlInit = (sql: string) => {
+  const m = sql.match(/TIMESTAMP\('(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\+00'\)/);
+  return m ? new Date(`${m[1].replace(" ", "T")}Z`).toISOString() : null;
+};
+
+type DryOpts = { published?: (init: string) => number; fetchEstimate?: number };
+
+/**
+ * Mock BigQuery. Dry-run probe → partition size for inits ≤ the published one
+ * (0 for newer); dry-run fetch → `fetchEstimate`; real jobs → handler rows.
+ */
+function runnerFor(handler: (sql: string) => WeatherNextRow[] | Promise<WeatherNextRow[]>, bytes = 90 * MIB, dry: DryOpts = {}) {
+  const published = dry.published ?? ((i: string) => (Date.parse(i) <= Date.parse(latestInit()) ? PARTITION_BYTES : 0));
+  _setWeatherNextRunner(async (sql, _cfg, opts) => {
+    if (opts?.dryRun) {
+      dryCalls.push({ sql });
+      const est = isProbe(sql) ? published(sqlInit(sql)!) : (dry.fetchEstimate ?? 1.47e12 / 64);
+      return { rows: [], bytesBilled: 0, bytesEstimated: est };
+    }
+    assert.ok(!isProbe(sql), "probe must never run as a billed job");
     calls.push({ sql });
     const rows = await handler(sql);
-    return { rows, bytesBilled: sql.includes("MAX(init_time)") ? 2 * MIB : bytes };
+    return { rows, bytesBilled: bytes };
   });
 }
 
-/** Map probe → latest init; fetch → rows for every city index in the STRUCT list. */
+/** Fetch → rows for every city index in the STRUCT list. */
 function defaultHandler(init = latestInit(), skip: number[] = []) {
   return (sql: string) => {
-    if (sql.includes("MAX(init_time)")) return [{ init_time: { value: init } }];
     const n = (sql.match(/STRUCT\(\d+ AS i/g) ?? []).length;
     const rows: WeatherNextRow[] = [];
     for (let i = 0; i < n; i++) if (!skip.includes(i)) rows.push(...fakeRows(i, init));
@@ -98,6 +123,7 @@ beforeEach(() => {
   _resetEnsembleGuards();
   _setWeatherNextConfig(cfg);
   calls = [];
+  dryCalls = [];
   realFetch = globalThis.fetch;
 });
 
@@ -195,14 +221,44 @@ describe("WeatherNext SQL + config", () => {
     assert.match(sql, /f\.hours <= 120/);
   });
 
-  it("probe SQL lists only due synoptic inits", () => {
+  it("probe SQL is a single-partition init_time equality (dry-run only)", () => {
     const now = Date.parse("2026-10-01T22:19:00Z");
     const c = dueInitCandidates(now, [0, 12]);
     assert.equal(c[0].toISOString(), "2026-10-01T12:00:00.000Z");
     assert.ok(c.every((d) => [0, 12].includes(d.getUTCHours())));
-    const sql = buildProbeSql(cfg, nyc, c);
-    assert.match(sql, /init_time IN \(TIMESTAMP\('2026-10-01 12:00:00\+00'\)/);
-    assert.match(sql, /ST_DWITHIN\(geography, ST_GEOGPOINT\(-73\.9654, 40\.7829\), 4000\)/);
+    const sql = buildProbeSql(cfg, c[0]);
+    assert.equal(
+      sql,
+      "SELECT init_time FROM `billing-proj.weathernext_3.weathernext_3_0_0_0p05deg` WHERE init_time = TIMESTAMP('2026-10-01 12:00:00+00')",
+    );
+    assert.ok(!/ IN \(|geography|forecast/.test(sql));
+  });
+
+  it("probeLatestInit dry-runs newest-first and stops at the loaded init", async () => {
+    const c = dueInitCandidates(Date.parse("2026-10-01T22:19:00Z"), [0, 12]);
+    const sizes: Record<string, number> = {
+      "2026-10-01T12:00:00.000Z": 0, // not published yet
+      "2026-10-01T00:00:00.000Z": 1_244_505_600,
+      "2026-09-30T12:00:00.000Z": 3_526_099_200,
+    };
+    runnerFor(defaultHandler(), 0, { published: (i) => sizes[i] ?? 0 });
+    const run = (globalThis as { __isobarWnRunner?: Parameters<typeof _setWeatherNextRunner>[0] }).__isobarWnRunner!;
+    assert.equal(await probeLatestInit(cfg, run, c, null), "2026-10-01T00:00:00.000Z");
+    assert.equal(dryCalls.length, 2);
+    // already on 00Z and 12Z still missing → one dry run, nothing newer
+    assert.equal(await probeLatestInit(cfg, run, c, "2026-10-01T00:00:00.000Z"), null);
+    assert.equal(dryCalls.length, 3);
+    sizes["2026-10-01T12:00:00.000Z"] = 3_318_681_600;
+    assert.equal(await probeLatestInit(cfg, run, c, "2026-10-01T00:00:00.000Z"), "2026-10-01T12:00:00.000Z");
+    assert.equal(calls.length, 0, "probing never runs a billed job");
+  });
+
+  it("weatherNextConfig: estimate limit defaults to 28 GiB and is overridable", () => {
+    const base = { ISOBAR_WEATHERNEXT_PROJECT: "p", ISOBAR_WEATHERNEXT_DATASET: "d" };
+    assert.equal(weatherNextConfig(base)!.maxEstimateBytes, 28 * 1024 ** 3);
+    assert.equal(weatherNextConfig({ ...base, ISOBAR_WEATHERNEXT_MAX_ESTIMATE_GIB: "2048" })!.maxEstimateBytes, 2048 * 1024 ** 3);
+    assert.equal(weatherNextConfig(base)!.dailyCapBytes, 8 * 1024 ** 3);
+    assert.equal(weatherNextConfig(base)!.monthlyCapBytes, 240 * 1024 ** 3);
   });
 
   it("weatherNextConfig: off unless project + dataset set; parses JSON / base64 creds", () => {
@@ -232,16 +288,79 @@ describe("WeatherNext SQL + config", () => {
 });
 
 describe("loadWeatherNext caching + budget (mocked BigQuery)", () => {
-  it("one probe + one batched fetch, then serves from cache with zero queries", async () => {
+  it("dry-run probe + one billed batched fetch, then serves from cache with zero queries", async () => {
     runnerFor(defaultHandler());
     const a = await loadWeatherNext([nyc, tokyo]);
-    assert.equal(calls.length, 2);
+    assert.equal(calls.length, 1);
     assert.equal(a.byCity.size, 2);
     assert.equal(a.init, latestInit());
-    assert.equal((calls[1].sql.match(/STRUCT\(\d+ AS i/g) ?? []).length, 2);
+    assert.equal((calls[0].sql.match(/STRUCT\(\d+ AS i/g) ?? []).length, 2);
+    assert.ok(dryCalls.some((c) => isProbe(c.sql)));
+    assert.ok(dryCalls.some((c) => c.sql === calls[0].sql), "fetch is dry-run first");
     for (let i = 0; i < 5; i++) await loadWeatherNext([nyc, tokyo]);
-    assert.equal(calls.length, 2);
-    assert.equal(weatherNextUsage()!.dayBytes, 10 * MIB + 90 * MIB); // probe billed at the 10 MiB minimum
+    assert.equal(calls.length, 1);
+    // only billed bytes count; dry runs are free
+    assert.equal(weatherNextUsage()!.dayBytes, 90 * MIB);
+  });
+
+  it("billed bytes below 10 MiB are charged at the BigQuery minimum", async () => {
+    runnerFor(defaultHandler(), 1 * MIB);
+    await loadWeatherNext([nyc]);
+    assert.equal(weatherNextUsage()!.dayBytes, 10 * MIB);
+  });
+
+  it("splits many cities into batches of FETCH_BATCH_SIZE, one billed job each", async () => {
+    const many: CityMeta[] = Array.from({ length: FETCH_BATCH_SIZE * 2 + 3 }, (_, i) => ({
+      ...nyc,
+      id: `c${i}`,
+      lat: 10 + i * 0.5,
+      lon: 10 + i * 0.5,
+    }));
+    runnerFor(defaultHandler());
+    const a = await loadWeatherNext(many);
+    assert.equal(calls.length, 3);
+    assert.deepEqual(
+      calls.map((c) => (c.sql.match(/STRUCT\(\d+ AS i/g) ?? []).length),
+      [FETCH_BATCH_SIZE, FETCH_BATCH_SIZE, 3],
+    );
+    assert.equal(a.byCity.size, many.length);
+    assert.equal(weatherNextUsage()!.dayBytes, 3 * 90 * MIB);
+  });
+
+  it("skips the billed job when the dry-run estimate exceeds the pre-run limit, and backs off", async () => {
+    runnerFor(defaultHandler(), 90 * MIB, { fetchEstimate: 1.47e12 });
+    const orig = console.error;
+    const logged: string[] = [];
+    console.error = (...a: unknown[]) => void logged.push(a.join(" "));
+    try {
+      const a = await loadWeatherNext([nyc]);
+      assert.equal(calls.length, 0);
+      assert.equal(a.byCity.size, 0);
+      assert.match(a.error ?? "", /estimate 1369 GiB > 28 GiB pre-run limit/);
+      const before = dryCalls.length;
+      await loadWeatherNext([nyc]);
+      assert.equal(dryCalls.length, before, "backed off: no further dry runs");
+      assert.equal(weatherNextUsage()?.dayBytes ?? 0, 0);
+      assert.ok(logged.some((l) => /pre-run limit/.test(l)));
+    } finally {
+      console.error = orig;
+    }
+  });
+
+  it("a raised estimate limit lets the same fetch run", async () => {
+    _setWeatherNextConfig({ ...cfg, maxEstimateBytes: 2048 * 1024 ** 3 });
+    runnerFor(defaultHandler(), 90 * MIB, { fetchEstimate: 1.47e12 });
+    const a = await loadWeatherNext([nyc]);
+    assert.equal(calls.length, 1);
+    assert.equal(a.byCity.size, 1);
+  });
+
+  it("no published init → dry runs only, no billed job", async () => {
+    runnerFor(defaultHandler(), 90 * MIB, { published: () => 0 });
+    const a = await loadWeatherNext([nyc]);
+    assert.equal(calls.length, 0);
+    assert.equal(a.byCity.size, 0);
+    assert.match(a.error ?? "", /no init loaded/);
   });
 
   it("concurrent callers share one in-flight refresh", async () => {
@@ -250,17 +369,16 @@ describe("loadWeatherNext caching + budget (mocked BigQuery)", () => {
       return defaultHandler()(sql);
     });
     await Promise.all([loadWeatherNext([nyc]), loadWeatherNext([nyc]), loadWeatherNext([nyc])]);
-    assert.equal(calls.length, 2);
+    assert.equal(calls.length, 1);
   });
 
   it("a new city on the same init fetches only that city", async () => {
     runnerFor(defaultHandler());
     await loadWeatherNext([nyc]);
     await loadWeatherNext([nyc, london]);
-    assert.equal(calls.length, 3);
-    assert.match(calls[2].sql, /-0\.1278 51\.5074/);
-    assert.ok(!calls[2].sql.includes("-73.9654"));
-    assert.ok(!calls[2].sql.includes("MAX(init_time)"));
+    assert.equal(calls.length, 2);
+    assert.match(calls[1].sql, /-0\.1278 51\.5074/);
+    assert.ok(!calls[1].sql.includes("-73.9654"));
   });
 
   it("errors back off instead of retrying every tick", async () => {
@@ -287,8 +405,8 @@ describe("loadWeatherNext caching + budget (mocked BigQuery)", () => {
     console.warn = () => {};
     try {
       const a = await loadWeatherNext([nyc]);
-      // probe (10 MiB) fits, the ~95 MiB fetch does not
-      assert.equal(calls.length, 1);
+      // the dry-run probe is free; the ~95 MiB fetch does not fit
+      assert.equal(calls.length, 0);
       assert.equal(a.byCity.size, 0);
       assert.match(a.error ?? "", /budget/);
     } finally {

@@ -1,4 +1,4 @@
-// Manual smoke test (not part of npm test): runs ONE probe + ONE batched fetch
+// Manual smoke test (not part of npm test): runs ONE dry-run probe + ONE batched fetch
 // through the real provider using Application Default Credentials, then prints
 // WeatherNext vs Open-Meteo ensemble daily-max means.
 //
@@ -6,7 +6,8 @@
 //   ISOBAR_DATA_DIR=/tmp/isobar-smoke \
 //   node --experimental-strip-types --import ./scripts/ts-test-resolve.mjs scripts/weathernext-smoke.ts nyc london tokyo
 //
-// Cost: ~10 MiB probe + ~90 MiB per city.
+// Cost: probe is a free dry run; ~90 MiB per city billed (fetch is dry-run first and skipped if the
+// estimate exceeds ISOBAR_WEATHERNEXT_MAX_ESTIMATE_GIB).
 import { CITIES } from "../src/lib/desk/cities.ts";
 import { loadWeatherNext, weatherNextUsage } from "../src/lib/desk/weathernext.ts";
 

@@ -27,6 +27,22 @@
  * to ISOBAR_DATA_DIR). When capped / unconfigured / failing we keep the last
  * good init (≤30 h old) or return nothing so weather.ts falls back to
  * Open-Meteo.
+ *
+ * Estimates vs bills: BigQuery's pre-run estimate ignores clustering, so it is
+ * the whole init_time partition for every selected column (measured on the
+ * 0.05° view, 2026-10-01 12Z: init_time+geography ≈ 21 GB, 4 forecast columns
+ * ≈ 1.47 TB) even though the bill is ~86 MiB/city. Project custom quotas
+ * (QueryUsagePerDay) and maximumBytesBilled are both enforced against that
+ * estimate *before* the job runs. So:
+ *   - the "is a new init out?" probe is a free dry run (estimate > 0 ⇔ the
+ *     partition exists), never a billed query;
+ *   - every fetch is preceded by a free dry run; if its estimate exceeds
+ *     maxEstimateBytes (default 28 GiB, under a 30 GiB custom quota) we skip
+ *     the job instead of letting BigQuery reject it, and back off;
+ *   - the in-code daily/monthly caps count *billed* bytes (the real cost,
+ *     min 10 MiB/job); the pre-flight cap check uses EST_BYTES_PER_CITY
+ *     (95 MiB, above the measured 86 MiB) so we never start a batch that
+ *     could cross a cap.
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -44,11 +60,14 @@ const REQUIRED_FIRST_LOCAL_HOUR = 11;
 const SEARCH_RADIUS_M = 4000;
 const STALE_INIT_MS = 30 * 3600_000;
 const ERROR_BACKOFF_MS = 10 * 60_000;
+/** Back-off after a quota / estimate rejection (retrying sooner cannot succeed). */
+const QUOTA_BACKOFF_MS = 60 * 60_000;
+/** Cities per fetch job (bill is per city; small batches bound a failed job's blast radius). */
+export const FETCH_BATCH_SIZE = 8;
 /** Typical WeatherNext publish latency after init_time (observed ~6–7 h). */
 const PUBLISH_LATENCY_MS = 5 * 3600_000;
 /** Conservative estimate used for the pre-flight budget check. */
 export const EST_BYTES_PER_CITY = 95 * MIB;
-export const EST_BYTES_PER_PROBE = 10 * MIB;
 
 export type WeatherNextConfig = {
   /** Project that runs (and pays for) the query jobs. */
@@ -64,14 +83,22 @@ export type WeatherNextConfig = {
   initHours: number[];
   dailyCapBytes: number;
   monthlyCapBytes: number;
+  /** Skip any job whose dry-run estimate exceeds this (BigQuery custom quotas reject on the estimate). */
+  maxEstimateBytes: number;
   /** Where to persist the byte counter; null = in-memory only. */
   usageFile: string | null;
   credentials?: Record<string, unknown>;
 };
 
 export type WeatherNextRow = Record<string, unknown>;
-export type WeatherNextResult = { rows: WeatherNextRow[]; bytesBilled: number | null };
-export type WeatherNextRunner = (sql: string, cfg: WeatherNextConfig) => Promise<WeatherNextResult>;
+export type WeatherNextResult = {
+  rows: WeatherNextRow[];
+  bytesBilled: number | null;
+  /** Dry run: BigQuery's pre-run estimate (totalBytesProcessed). */
+  bytesEstimated?: number | null;
+};
+export type WeatherNextRunOpts = { dryRun?: boolean };
+export type WeatherNextRunner = (sql: string, cfg: WeatherNextConfig, opts?: WeatherNextRunOpts) => Promise<WeatherNextResult>;
 
 export type WeatherNextCity = {
   init: string;
@@ -188,6 +215,7 @@ export function weatherNextConfig(env: Record<string, string | undefined> = proc
     initHours: initHours.length ? [...new Set(initHours)].sort((a, b) => a - b) : [0, 12],
     dailyCapBytes: num(env.ISOBAR_WEATHERNEXT_DAILY_GIB, 8, 0, 1024) * GIB,
     monthlyCapBytes: num(env.ISOBAR_WEATHERNEXT_MONTHLY_GIB, 240, 0, 1024) * GIB,
+    maxEstimateBytes: num(env.ISOBAR_WEATHERNEXT_MAX_ESTIMATE_GIB, 28, 0, 1024 * 1024) * GIB,
     usageFile: join(dataDir, "weathernext-usage.json"),
     ...(credentials ? { credentials } : {}),
   };
@@ -221,12 +249,13 @@ export function dueInitCandidates(nowMs: number, initHours: number[], lookbackH 
   return out;
 }
 
-export function buildProbeSql(cfg: WeatherNextConfig, city: CityMeta, candidates: Date[]) {
-  return [
-    `SELECT MAX(init_time) AS init_time FROM ${tableRef(cfg)}`,
-    `WHERE init_time IN (${candidates.map(tsLiteral).join(", ")})`,
-    `AND ST_DWITHIN(geography, ST_GEOGPOINT(${coord(city.lon)}, ${coord(city.lat)}), ${SEARCH_RADIUS_M})`,
-  ].join("\n");
+/**
+ * Existence probe for ONE init. Only ever run as a dry run (free, not billed,
+ * not counted against quota): the estimate is the size of that init_time
+ * partition's init_time column, 0 when the partition does not exist.
+ */
+export function buildProbeSql(cfg: WeatherNextConfig, init: Date) {
+  return `SELECT init_time FROM ${tableRef(cfg)} WHERE init_time = ${tsLiteral(init)}`;
 }
 
 /**
@@ -422,7 +451,7 @@ export function parseFetchRows(rows: WeatherNextRow[], cities: CityMeta[]): Map<
 
 /* ------------------------------------------------------------------ runner */
 
-async function defaultRunner(sql: string, cfg: WeatherNextConfig): Promise<WeatherNextResult> {
+async function defaultRunner(sql: string, cfg: WeatherNextConfig, opts: WeatherNextRunOpts = {}): Promise<WeatherNextResult> {
   const glob = g();
   const key = `${cfg.projectId}:${cfg.credentials ? "json" : "adc"}`;
   if (!glob.__isobarWnClient || glob.__isobarWnClient.key !== key) {
@@ -433,6 +462,11 @@ async function defaultRunner(sql: string, cfg: WeatherNextConfig): Promise<Weath
     };
   }
   const client = glob.__isobarWnClient.client as import("@google-cloud/bigquery").BigQuery;
+  if (opts.dryRun) {
+    const [job] = await client.createQueryJob({ query: sql, location: cfg.location, useLegacySql: false, dryRun: true });
+    const est = Number(job.metadata?.statistics?.totalBytesProcessed ?? job.metadata?.statistics?.query?.totalBytesProcessed);
+    return { rows: [], bytesBilled: 0, bytesEstimated: Number.isFinite(est) ? est : null };
+  }
   const [job] = await client.createQueryJob({
     query: sql,
     location: cfg.location,
@@ -488,7 +522,11 @@ function withinBudget(cfg: WeatherNextConfig, nowMs: number, estBytes: number) {
   return u.dayBytes + estBytes <= cfg.dailyCapBytes && u.monthBytes + estBytes <= cfg.monthlyCapBytes;
 }
 
-/** BigQuery bills ≥10 MiB per query even when it reports less. */
+/**
+ * Bytes charged to the in-code caps: BigQuery's totalBytesBilled (the real
+ * cost; it bills ≥10 MiB per query). Falls back to the conservative pre-flight
+ * estimate only if the job did not report billed bytes.
+ */
 function billed(res: WeatherNextResult, est: number) {
   return Math.max(res.bytesBilled ?? est, 10 * MIB);
 }
@@ -543,6 +581,97 @@ export async function loadWeatherNext(cities: CityMeta[]): Promise<WeatherNextLo
   return st.inflight;
 }
 
+/** Thrown when BigQuery's pre-run estimate is above maxEstimateBytes (job not started). */
+export class WeatherNextEstimateError extends Error {}
+
+function isQuotaError(msg: string) {
+  return /custom quota|quotaExceeded|usageQuotaExceeded|exceeded limit for bytes billed|bytesBilledLimitExceeded/i.test(msg);
+}
+
+const fmtGiB = (b: number) => (b / GIB).toFixed(b < 10 * GIB ? 2 : 0);
+
+/**
+ * Newest due init (newer than `after`) whose partition exists. Dry runs only →
+ * free and not counted against any quota; estimate > 0 ⇔ the init_time
+ * partition has data. (Partition sizes vary 1.2–5 GB between inits, so the
+ * size is not used as a completeness signal; PUBLISH_LATENCY_MS plus the
+ * per-date coverage rule in dailyMaxMembers guard against partial inits.)
+ */
+export async function probeLatestInit(
+  cfg: WeatherNextConfig,
+  run: WeatherNextRunner,
+  candidates: Date[],
+  after: string | null,
+): Promise<string | null> {
+  for (const d of candidates) {
+    if (after && d.getTime() <= Date.parse(after)) break;
+    const r = await run(buildProbeSql(cfg, d), cfg, { dryRun: true });
+    if (Number.isFinite(r.bytesEstimated) && (r.bytesEstimated as number) > 0) return d.toISOString();
+  }
+  return null;
+}
+
+type FetchOutcome = { parsed: Map<string, WeatherNextCity>; empty: Set<string>; error: unknown };
+
+/**
+ * Fetch `cities` for one init in batches of FETCH_BATCH_SIZE. A free dry run
+ * of the first batch gates the whole pass on maxEstimateBytes (every batch hits
+ * the same partition + columns, so the estimate is identical). Each batch is
+ * budget-checked with EST_BYTES_PER_CITY and charged its billed bytes.
+ * Returns whatever succeeded plus the first error, so a later failure does not
+ * throw away bytes already paid for.
+ */
+async function fetchCities(
+  cfg: WeatherNextConfig,
+  run: WeatherNextRunner,
+  cities: CityMeta[],
+  init: string,
+  now: number,
+): Promise<FetchOutcome> {
+  const parsed = new Map<string, WeatherNextCity>();
+  const empty = new Set<string>();
+  try {
+    for (let k = 0; k < cities.length; k += FETCH_BATCH_SIZE) {
+      const batch = cities.slice(k, k + FETCH_BATCH_SIZE);
+      const sql = buildFetchSql(cfg, batch, init);
+      if (k === 0) {
+        const dry = await run(sql, cfg, { dryRun: true });
+        const estimate = dry.bytesEstimated;
+        if (Number.isFinite(estimate) && (estimate as number) > cfg.maxEstimateBytes) {
+          throw new WeatherNextEstimateError(
+            `fetch estimate ${fmtGiB(estimate as number)} GiB > ${fmtGiB(cfg.maxEstimateBytes)} GiB pre-run limit ` +
+              `(BigQuery quotas check the clustering-blind estimate; bill would be ~${Math.round((EST_BYTES_PER_CITY * batch.length) / MIB)} MiB); job not started`,
+          );
+        }
+      }
+      const est = EST_BYTES_PER_CITY * batch.length;
+      if (!withinBudget(cfg, now, est)) {
+        throw new Error("WeatherNext byte budget reached");
+      }
+      const res = await run(sql, cfg);
+      recordUsage(cfg, now, billed(res, est));
+      const got = parseFetchRows(res.rows, batch);
+      for (const [id, v] of got) parsed.set(id, v);
+      for (const c of batch) if (!got.has(c.id)) empty.add(c.id);
+    }
+    return { parsed, empty, error: null };
+  } catch (error) {
+    return { parsed, empty, error };
+  }
+}
+
+function fail(cities: CityMeta[], now: number, err: unknown): WeatherNextLoad {
+  const st = state();
+  const msg = err instanceof Error ? err.message : String(err);
+  const budget = /byte budget reached/.test(msg);
+  const quota = err instanceof WeatherNextEstimateError || isQuotaError(msg);
+  st.lastError = budget ? msg : `WeatherNext failed: ${msg.slice(0, 240)}`;
+  st.backoffUntil = now + (quota || budget ? QUOTA_BACKOFF_MS : ERROR_BACKOFF_MS);
+  if (budget) console.warn("[isobar] WeatherNext budget: keeping previous init", st.init);
+  else console.error("[isobar]", st.lastError);
+  return pick(cities, budget && st.init ? null : st.lastError);
+}
+
 async function refresh(cfg: WeatherNextConfig, cities: CityMeta[]): Promise<WeatherNextLoad> {
   const st = state();
   const now = Date.now();
@@ -550,32 +679,31 @@ async function refresh(cfg: WeatherNextConfig, cities: CityMeta[]): Promise<Weat
   const run = g().__isobarWnRunner ?? defaultRunner;
 
   try {
-    // 1) Is a newer init due and not loaded yet? Probe at most every probeMs.
+    // 1) Is a newer init due and not loaded yet? Free dry-run probe, at most every probeMs.
     const candidates = dueInitCandidates(now, cfg.initHours);
     const newestDue = candidates[0]?.toISOString() ?? null;
     const behind = !st.init || (newestDue != null && Date.parse(newestDue) > Date.parse(st.init));
     if (behind && now - st.lastProbeAt >= cfg.probeMs && candidates.length) {
-      if (!withinBudget(cfg, now, EST_BYTES_PER_PROBE)) {
-        return pick(cities, "WeatherNext byte budget reached");
-      }
       st.lastProbeAt = now;
-      const res = await run(buildProbeSql(cfg, cities[0], candidates), cfg);
-      recordUsage(cfg, now, billed(res, EST_BYTES_PER_PROBE));
-      const latest = toIso(res.rows[0]?.init_time);
-      if (latest && (!st.init || Date.parse(latest) > Date.parse(st.init))) {
-        const est = EST_BYTES_PER_CITY * cities.length;
-        if (!withinBudget(cfg, now, est)) {
+      const latest = await probeLatestInit(cfg, run, candidates, st.init);
+      if (latest) {
+        if (!withinBudget(cfg, now, EST_BYTES_PER_CITY * cities.length)) {
           console.warn("[isobar] WeatherNext budget: keeping previous init", st.init);
           return pick(cities, st.init ? null : "WeatherNext byte budget reached");
         }
-        const fetched = await run(buildFetchSql(cfg, cities, latest), cfg);
-        recordUsage(cfg, now, billed(fetched, est));
-        const parsed = parseFetchRows(fetched.rows, cities);
-        if (!parsed.size) throw new Error(`WeatherNext init ${latest} returned no cells`);
-        st.init = latest;
-        st.cities = parsed;
-        st.empty = new Set(cities.filter((c) => !parsed.has(c.id)).map((c) => c.id));
-        st.lastError = null;
+        const out = await fetchCities(cfg, run, cities, latest, now);
+        if (out.parsed.size) {
+          st.init = latest;
+          st.cities = out.parsed;
+          st.empty = out.empty;
+          st.lastError = null;
+          console.log(
+            `[isobar] WeatherNext init ${latest} loaded for ${out.parsed.size}/${cities.length} cities` +
+              ` (usage today ${Math.round((st.usage?.dayBytes ?? 0) / MIB)} MiB billed)`,
+          );
+        }
+        if (out.error) return fail(cities, now, out.error);
+        if (!out.parsed.size) throw new Error(`WeatherNext init ${latest} returned no cells`);
         return pick(cities, null);
       }
     }
@@ -583,24 +711,16 @@ async function refresh(cfg: WeatherNextConfig, cities: CityMeta[]): Promise<Weat
     // 2) Same init, new cities appeared (e.g. a new Polymarket event).
     if (st.init) {
       const missing = cities.filter((c) => !st.cities.has(c.id) && !st.empty.has(c.id));
-      if (missing.length) {
-        const est = EST_BYTES_PER_CITY * missing.length;
-        if (withinBudget(cfg, now, est)) {
-          const fetched = await run(buildFetchSql(cfg, missing, st.init), cfg);
-          recordUsage(cfg, now, billed(fetched, est));
-          const parsed = parseFetchRows(fetched.rows, missing);
-          for (const [id, v] of parsed) st.cities.set(id, v);
-          for (const c of missing) if (!parsed.has(c.id)) st.empty.add(c.id);
-        }
+      if (missing.length && withinBudget(cfg, now, EST_BYTES_PER_CITY * Math.min(missing.length, FETCH_BATCH_SIZE))) {
+        const out = await fetchCities(cfg, run, missing, st.init, now);
+        for (const [id, v] of out.parsed) st.cities.set(id, v);
+        for (const id of out.empty) st.empty.add(id);
+        if (out.error) return fail(cities, now, out.error);
       }
     }
     return pick(cities, st.init ? null : "WeatherNext: no init loaded yet");
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    st.lastError = `WeatherNext failed: ${msg.slice(0, 200)}`;
-    st.backoffUntil = now + ERROR_BACKOFF_MS;
-    console.error("[isobar]", st.lastError);
-    return pick(cities, st.lastError);
+    return fail(cities, now, err);
   }
 }
 
