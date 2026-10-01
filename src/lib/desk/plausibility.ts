@@ -66,8 +66,9 @@ function resolveBucket(
   const parsed = parseLabelTemp(signal.label ?? "");
   if (!parsed) return null;
   const u = parsed.unit ?? unit;
-  // Exact-degree bucket: [n, n+1)
-  return { lo: parsed.value, hi: parsed.value + 1, unit: u };
+  // Exact-degree bucket under whole-degree rounding settlement: [n - 0.5, n + 0.5)
+  // (callers normally pass ctx.lo/hi from parseBucket, which knows the market's rule).
+  return { lo: parsed.value - 0.5, hi: parsed.value + 0.5, unit: u };
 }
 
 function membersInBucket(members: number[], bucket: { lo: number; hi: number; unit: TempUnit }): number {

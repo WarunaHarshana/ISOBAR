@@ -9,8 +9,12 @@ export type CityMeta = {
   lat: number;
   lon: number;
   tz: string;
+  /** METAR id of the settlement station ("" when it has no METAR, e.g. HKO). */
   icao: string;
   country: string;
+  /** Settlement station name from the market rules. */
+  station?: string | null;
+  settlementSource?: "noaa" | "wunderground" | "hko" | "unverified";
 };
 
 export type BucketBound = {

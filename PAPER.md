@@ -65,6 +65,13 @@ Never attach Polymarket/CLOB secrets to this service. Do not wire this to poly5m
 
 `GET /health` → `{ ok, worker: { running, armed, lastTickAt, openFills, … }, openFills }`
 
+## Settlement model
+
+- Forecast points and METAR observations use the **settlement station** from the market rules (`cities.ts`), e.g. NYC = LaGuardia (KLGA), London = London City (EGLC), Paris = Le Bourget (LFPB), Hong Kong = HK Observatory (no METAR).
+- NOAA/Weather Underground markets settle on whole degrees (nearest), so a bucket "72°F" is the true max in [71.5, 72.5). HKO markets ("one decimal place") truncate: "28°C" = [28.0, 29.0). The rule is read from each event description.
+- Observed max = max METAR temperature at the settlement station since local midnight, at or before now (aviationweather `hours=` history). Forecast hours never count as observed, and it only conditions today's (local) HIGH markets.
+- "Lowest temperature" events are shown but never priced (members are daily maxima).
+
 ## Caps (Quant freeze)
 
 - Min edge 6¢, price 5–85¢

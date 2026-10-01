@@ -31,34 +31,57 @@ export function parseNumber(raw: unknown, fallback = 0) {
   return fallback;
 }
 
-export function parseBucket(question: string, groupTitle?: string | null): BucketBound | null {
+/**
+ * How the resolution source turns the true temperature into the settled number.
+ * - "round": NOAA/Weather Underground station reports in whole degrees of the
+ *   market unit (METAR/ASOS → nearest degree). A "72°F" bucket wins when the
+ *   true max is in [71.5, 72.5). Verified against closed KLGA/KMIA/EGLC/RJTT
+ *   markets vs METAR history (e.g. KMIA 28.3 °C = 82.9 °F → "82-83°F").
+ * - "floor": Hong Kong Observatory "Absolute Daily Max" to 0.1 °C; Polymarket
+ *   buckets contain the reading truncated to the degree (Aug 2026: 32.5 → "32°C",
+ *   36.9 → "36°C"), so "28°C" = [28.0, 29.0).
+ */
+export type SettlementRule = "round" | "floor";
+
+/** Pick the rule from a Gamma event/market description. */
+export function settlementRule(description: string | null | undefined): SettlementRule {
+  return /one decimal place/i.test(description ?? "") ? "floor" : "round";
+}
+
+/**
+ * Bucket bounds on the continuous true temperature, half-open [lo, hi), in the
+ * market's unit, matching the settlement rule.
+ */
+export function parseBucket(question: string, groupTitle?: string | null, rule: SettlementRule = "round"): BucketBound | null {
   const unitMatch = question.match(/°\s*([CF])/i);
   const unit = (unitMatch?.[1]?.toUpperCase() === "F" ? "F" : "C") as TempUnit;
   const deg = unit === "F" ? "°F" : "°C";
+  // Reported value n covers [n + off, n + 1 + off).
+  const off = rule === "floor" ? 0 : -0.5;
 
-  const below = question.match(/be\s+(?:between\s+)?(\d+)(?:\s*[-–]\s*\d+)?\s*°/i);
+  const below = question.match(/be\s+(?:between\s+)?(-?\d+)(?:\s*[-–]\s*-?\d+)?\s*°/i);
   if (/or below/i.test(question) && below) {
     const n = Number(below[1]);
-    return { lo: -Infinity, hi: n + 1, kind: "floor", label: groupTitle?.trim() || `${n}${deg} or below` };
+    return { lo: -Infinity, hi: n + 1 + off, kind: "floor", label: groupTitle?.trim() || `${n}${deg} or below` };
   }
 
-  const above = question.match(/be\s+(\d+)\s*°/i);
+  const above = question.match(/be\s+(-?\d+)\s*°/i);
   if (/or higher/i.test(question) && above) {
     const n = Number(above[1]);
-    return { lo: n, hi: Infinity, kind: "ceil", label: groupTitle?.trim() || `${n}${deg}+` };
+    return { lo: n + off, hi: Infinity, kind: "ceil", label: groupTitle?.trim() || `${n}${deg}+` };
   }
 
-  const range = question.match(/between\s+(\d+)\s*[-–]\s*(\d+)\s*°/i);
+  const range = question.match(/between\s+(-?\d+)\s*[-–]\s*(-?\d+)\s*°/i);
   if (range) {
     const a = Number(range[1]);
     const b = Number(range[2]);
-    return { lo: a, hi: b + 1, kind: "range", label: groupTitle?.trim() || `${a}–${b}${deg}` };
+    return { lo: a + off, hi: b + 1 + off, kind: "range", label: groupTitle?.trim() || `${a}–${b}${deg}` };
   }
 
-  const exact = question.match(/be\s+(\d+)\s*°/i);
+  const exact = question.match(/be\s+(-?\d+)\s*°/i);
   if (exact) {
     const n = Number(exact[1]);
-    return { lo: n, hi: n + 1, kind: "exact", label: groupTitle?.trim() || `${n}${deg}` };
+    return { lo: n + off, hi: n + 1 + off, kind: "exact", label: groupTitle?.trim() || `${n}${deg}` };
   }
 
   return null;

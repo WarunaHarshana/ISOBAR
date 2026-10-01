@@ -35,6 +35,7 @@ type PrevResult = {
 
 type Metar = {
   icaoId?: string;
+  obsTime?: number;
   temp?: number;
   dewp?: number;
   wspd?: number;
@@ -51,7 +52,8 @@ type EnsembleLoad = {
 };
 
 type EnsembleGlobals = {
-  __isobarEnsInflight?: Promise<EnsembleLoad> | null;
+  /** Single-flight per exact city set (never hand one list's result to another). */
+  __isobarEnsInflight?: Map<string, Promise<EnsembleLoad>> | null;
   __isobarEnsNegUntil?: number;
   __isobarEnsNeg?: EnsembleLoad | null;
 };
@@ -177,9 +179,13 @@ function setNegativeCache(msg: string | null | undefined): EnsembleLoad {
 /** Test helper — drop 429 cooldown + single-flight between cases. */
 export function _resetEnsembleGuards() {
   const glob = g();
-  glob.__isobarEnsInflight = null;
+  glob.__isobarEnsInflight = new Map();
   glob.__isobarEnsNegUntil = 0;
   glob.__isobarEnsNeg = null;
+}
+
+export function ensembleKey(cities: CityMeta[]) {
+  return [...new Set(cities.map((c) => c.id))].sort().join(",");
 }
 
 async function loadEnsemble(cities: CityMeta[]): Promise<EnsembleLoad> {
@@ -189,11 +195,15 @@ async function loadEnsemble(cities: CityMeta[]): Promise<EnsembleLoad> {
   if (glob.__isobarEnsNegUntil && now < glob.__isobarEnsNegUntil) {
     return glob.__isobarEnsNeg ?? { map: new Map(), error: "ensemble rate-limited" };
   }
-  if (glob.__isobarEnsInflight) return glob.__isobarEnsInflight;
-  glob.__isobarEnsInflight = loadEnsembleOnce(cities).finally(() => {
-    glob.__isobarEnsInflight = null;
+  const key = ensembleKey(cities);
+  const inflight = (glob.__isobarEnsInflight ??= new Map());
+  const hit = inflight.get(key);
+  if (hit) return hit;
+  const p = loadEnsembleOnce(cities).finally(() => {
+    inflight.delete(key);
   });
-  return glob.__isobarEnsInflight;
+  inflight.set(key, p);
+  return p;
 }
 
 async function loadEnsembleOnce(cities: CityMeta[]): Promise<EnsembleLoad> {
@@ -281,7 +291,7 @@ export async function loadWeather(cities: CityMeta[]): Promise<Record<string, We
     console.error("[isobar] forecast fetch failed", err);
     return null;
   });
-  const metarsP = loadMetars(unique).catch((err) => {
+  const metarsP = loadMetarHistory(unique).catch((err) => {
     console.error("[isobar] METAR fetch failed", err);
     return null;
   });
@@ -313,18 +323,16 @@ export async function loadWeather(cities: CityMeta[]): Promise<Record<string, We
 
   for (const city of unique) {
     const prev = previous?.get(city.id);
-    const metar = metars?.get(city.icao);
     const wnCity = wnCovers(city.id) ? wn.byCity.get(city.id) : undefined;
     // UI hourly: Open-Meteo forecast when present, else WeatherNext p50 (local wall-clock strings, same shape).
     const hourly = prev?.hourly ?? (wnCity ? localHourly(wnCity.hourly, city.tz, now) : []);
-    // Only the Open-Meteo hourly feeds observedFromHourly (unchanged behaviour); WN p50 is never "observed".
-    const pastHours = (prev?.hourly ?? []).filter((h) => Date.parse(h.time) <= now);
-    const observedFromHourly = pastHours.length ? Math.max(...pastHours.map((h) => h.tempC)) : null;
+    const metar = metars?.latest.get(city.icao);
     const metarC = metar?.temp ?? null;
+    // Display only — never used as an observation.
     const currentC = metarC ?? prev?.currentC ?? (hourly[0]?.tempC ?? null);
-    const observedMaxC = [observedFromHourly, metarC, currentC]
-      .filter((n): n is number => n != null)
-      .reduce((a, b) => Math.max(a, b), -Infinity);
+    // Observed max = real METAR reports at the settlement station, obsTime <= now,
+    // inside the city's current local day. Forecast hours are never "observed".
+    const observedMaxC = metars ? observedMaxForLocalDay(metars.reports.get(city.icao) ?? [], city.tz, now) : null;
     // One provider per city (never mix members across providers for a date).
     const membersByDate: Record<string, number[]> = wnCity ? { ...wnCity.membersByDate } : {};
     if (!wnCity) {
@@ -352,9 +360,9 @@ export async function loadWeather(cities: CityMeta[]): Promise<Record<string, We
       windMs: metar?.wspd != null ? metar.wspd * 0.5144 : (prev?.windMs ?? null),
       weatherCode: prev?.weatherCode ?? null,
       cover: metar?.cover ?? null,
-      station: metar?.name ?? (city.icao || null),
+      station: city.station ?? metar?.name ?? (city.icao || null),
       observedAt: metar?.reportTime ?? prev?.currentTime ?? null,
-      observedMaxC: Number.isFinite(observedMaxC) ? observedMaxC : null,
+      observedMaxC,
       modelMeanC: members.length ? mean(members) : (prev?.dailyMax ?? null),
       modelStdC: members.length ? stdev(members) : null,
       modelMinC: members.length ? Math.min(...members) : null,
@@ -443,16 +451,89 @@ async function loadPrevious(cities: CityMeta[]) {
   return map;
 }
 
-async function loadMetars(cities: CityMeta[]) {
-  const ids = cities.map((c) => c.icao).filter(Boolean).join(",");
-  if (!ids) return new Map<string, Metar>();
-  const url = `https://aviationweather.gov/api/data/metar?ids=${ids}&format=json`;
-  const raw = await cached(`metar:${ids}`, 3 * 60_000, () =>
+type MetarHistory = { latest: Map<string, Metar>; reports: Map<string, Metar[]> };
+
+/** aviationweather.gov caps a response at 400 rows; keep batches well under it. */
+const METAR_ROW_CAP = 400;
+const METAR_BATCH = 6;
+const METAR_TTL = 5 * 60_000;
+
+function localDateOf(ms: number, tz: string) {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: tz || "UTC" }).format(new Date(ms));
+}
+
+/** Hours since local midnight in tz (+1 h slack), for the METAR `hours=` window. */
+export function hoursSinceLocalMidnight(tz: string, now: number) {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-CA", { timeZone: tz || "UTC", hour: "2-digit", minute: "2-digit", hourCycle: "h23" })
+      .formatToParts(new Date(now))
+      .map((p) => [p.type, p.value]),
+  );
+  return Math.min(30, Math.ceil(Number(parts.hour) + Number(parts.minute) / 60) + 1);
+}
+
+function metarMs(m: Metar) {
+  if (typeof m.obsTime === "number") return m.obsTime * 1000;
+  const t = Date.parse(m.reportTime ?? "");
+  return Number.isFinite(t) ? t : NaN;
+}
+
+/** Max METAR temp (°C) observed at or before now on the city's current local date. */
+export function observedMaxForLocalDay(reports: Metar[], tz: string, now: number): number | null {
+  const today = localDateOf(now, tz);
+  let best: number | null = null;
+  for (const r of reports) {
+    const ms = metarMs(r);
+    if (!Number.isFinite(ms) || ms > now || typeof r.temp !== "number" || !Number.isFinite(r.temp)) continue;
+    if (localDateOf(ms, tz) !== today) continue;
+    best = best == null ? r.temp : Math.max(best, r.temp);
+  }
+  return best;
+}
+
+async function fetchMetarBatch(ids: string[], hours: number): Promise<Metar[]> {
+  const url = `https://aviationweather.gov/api/data/metar?ids=${ids.join(",")}&format=json&hours=${hours}`;
+  const rows = await cached(`metarh:${ids.join(",")}:${hours}`, METAR_TTL, () =>
     fetchJson<Metar[]>(url, { headers: { "user-agent": "IsobarDesk/1.0" } }),
   );
-  const map = new Map<string, Metar>();
-  for (const row of raw ?? []) {
-    if (row.icaoId) map.set(row.icaoId, row);
+  const list = Array.isArray(rows) ? rows : [];
+  // Possibly truncated → split and retry so no station loses its early-day reports.
+  if (list.length >= METAR_ROW_CAP && ids.length > 1) {
+    const mid = Math.ceil(ids.length / 2);
+    const [a, b] = await Promise.all([fetchMetarBatch(ids.slice(0, mid), hours), fetchMetarBatch(ids.slice(mid), hours)]);
+    return [...a, ...b];
   }
-  return map;
+  return list;
+}
+
+/** Today's METAR history per station (all reports since local midnight). */
+async function loadMetarHistory(cities: CityMeta[], now = Date.now()): Promise<MetarHistory> {
+  const withIcao = cities.filter((c) => c.icao);
+  const need = new Map<string, number>();
+  for (const c of withIcao) need.set(c.icao, Math.max(need.get(c.icao) ?? 0, hoursSinceLocalMidnight(c.tz, now)));
+  const ids = [...need.keys()].sort((a, b) => need.get(a)! - need.get(b)!);
+  const batches: Array<{ ids: string[]; hours: number }> = [];
+  for (let i = 0; i < ids.length; i += METAR_BATCH) {
+    const chunk = ids.slice(i, i + METAR_BATCH);
+    batches.push({ ids: chunk, hours: Math.max(...chunk.map((id) => need.get(id)!)) });
+  }
+  const results = await Promise.all(
+    batches.map((b) =>
+      fetchMetarBatch(b.ids, b.hours).catch((err) => {
+        console.error("[isobar] METAR history batch failed", b.ids.join(","), err instanceof Error ? err.message : err);
+        return [] as Metar[];
+      }),
+    ),
+  );
+  const reports = new Map<string, Metar[]>();
+  const latest = new Map<string, Metar>();
+  for (const row of results.flat()) {
+    if (!row.icaoId) continue;
+    const list = reports.get(row.icaoId);
+    if (list) list.push(row);
+    else reports.set(row.icaoId, [row]);
+    const prev = latest.get(row.icaoId);
+    if (!prev || metarMs(row) > metarMs(prev)) latest.set(row.icaoId, row);
+  }
+  return { latest, reports };
 }

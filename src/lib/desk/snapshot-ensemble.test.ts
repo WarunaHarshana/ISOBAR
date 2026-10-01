@@ -63,11 +63,12 @@ function event(over: Partial<ParsedEvent> = {}): ParsedEvent {
     liquidity: 200,
     image: null,
     context: null,
+    settlement: "round",
     markets: [
       {
         id: "m1",
         question: "Will the highest temperature be 80\u00b0F?",
-        bound: { lo: 80, hi: 81, label: "80\u00b0F", kind: "exact" },
+        bound: { lo: 79.5, hi: 80.5, label: "80\u00b0F", kind: "exact" },
         yesPrice: 0.4,
         noPrice: 0.6,
         tokens: [],
