@@ -1,6 +1,8 @@
 import type { CityMeta, HourPoint, WeatherNow } from "./types";
 import { cached, fetchJson } from "./cache";
 import { mean, stdev } from "./math";
+import { ensembleOk } from "./ensemble";
+import { loadWeatherNext, weatherNextSourceLabel, type WeatherNextLoad } from "./weathernext";
 
 type EnsembleResult = {
   latitude: number;
@@ -54,6 +56,12 @@ type EnsembleGlobals = {
   __isobarEnsNeg?: EnsembleLoad | null;
 };
 
+/**
+ * Open-Meteo's ensemble API now rejects requests without `models=`
+ * ("Model 'best_match' is not supported by the Ensemble API", HTTP 400), which
+ * the chunking logic below misread as URI-too-long. ECMWF IFS 0.25° ENS = 51 members.
+ */
+const ENSEMBLE_MODEL = "ecmwf_ifs025";
 const ENSEMBLE_CHUNK = 8;
 const ENSEMBLE_TTL = 8 * 60_000;
 const ENSEMBLE_TIMEOUT_MS = 20_000;
@@ -115,7 +123,7 @@ async function fetchEnsembleBatch(cities: CityMeta[], timezone: string) {
   const lats = cities.map((c) => c.lat.toFixed(4)).join(",");
   const lons = cities.map((c) => c.lon.toFixed(4)).join(",");
   const tz = encodeURIComponent(timezone);
-  const url = `https://ensemble-api.open-meteo.com/v1/ensemble?latitude=${lats}&longitude=${lons}&daily=temperature_2m_max,temperature_2m_min&forecast_days=4&timezone=${tz}`;
+  const url = `https://ensemble-api.open-meteo.com/v1/ensemble?latitude=${lats}&longitude=${lons}&daily=temperature_2m_max,temperature_2m_min&forecast_days=4&timezone=${tz}&models=${ENSEMBLE_MODEL}`;
   const cacheKey = `ens:tz:${timezone}:${cities.map((c) => c.id).join(",")}`;
   const raw = await cached(cacheKey, ENSEMBLE_TTL, () =>
     fetchJson<EnsembleResult | EnsembleResult[]>(url, {}, ENSEMBLE_TIMEOUT_MS),
@@ -263,7 +271,29 @@ export async function loadWeather(cities: CityMeta[]): Promise<Record<string, We
   const unique = [...new Map(cities.filter((c) => c.lat !== 0 || c.lon !== 0).map((c) => [c.id, c])).values()];
   if (!unique.length) return {};
 
-  const ensembleP = loadEnsemble(unique).then(
+  // Primary: WeatherNext 3 (BigQuery). Unconfigured / failing → empty map.
+  const wnP: Promise<WeatherNextLoad> = loadWeatherNext(unique).catch((err) => {
+    const error = err instanceof Error ? err.message : String(err);
+    console.error("[isobar] WeatherNext load failed", error);
+    return { configured: true, init: null, byCity: new Map(), error };
+  });
+  const previousP = loadPrevious(unique).catch((err) => {
+    console.error("[isobar] forecast fetch failed", err);
+    return null;
+  });
+  const metarsP = loadMetars(unique).catch((err) => {
+    console.error("[isobar] METAR fetch failed", err);
+    return null;
+  });
+
+  const wn = await wnP;
+  const wnCovers = (cityId: string) => {
+    const hit = wn.byCity.get(cityId);
+    return Boolean(hit && Object.values(hit.membersByDate).some((m) => ensembleOk(m)));
+  };
+  // Fallback: Open-Meteo ensemble only for cities WeatherNext did not cover.
+  const omCities = unique.filter((c) => !wnCovers(c.id));
+  const ensembleP = loadEnsemble(omCities).then(
     (r) => r,
     (err) => {
       const error = err instanceof Error ? err.message : String(err);
@@ -272,17 +302,7 @@ export async function loadWeather(cities: CityMeta[]): Promise<Record<string, We
     },
   );
 
-  const [ensemble, previous, metars] = await Promise.all([
-    ensembleP,
-    loadPrevious(unique).catch((err) => {
-      console.error("[isobar] forecast fetch failed", err);
-      return null;
-    }),
-    loadMetars(unique).catch((err) => {
-      console.error("[isobar] METAR fetch failed", err);
-      return null;
-    }),
-  ]);
+  const [ensemble, previous, metars] = await Promise.all([ensembleP, previousP, metarsP]);
 
   if (ensemble.error) {
     console.error("[isobar] ensemble unavailable", ensemble.error);
@@ -294,26 +314,33 @@ export async function loadWeather(cities: CityMeta[]): Promise<Record<string, We
   for (const city of unique) {
     const prev = previous?.get(city.id);
     const metar = metars?.get(city.icao);
-    const hourly = prev?.hourly ?? [];
-    const pastHours = hourly.filter((h) => Date.parse(h.time) <= now);
+    const wnCity = wnCovers(city.id) ? wn.byCity.get(city.id) : undefined;
+    // UI hourly: Open-Meteo forecast when present, else WeatherNext p50 (local wall-clock strings, same shape).
+    const hourly = prev?.hourly ?? (wnCity ? localHourly(wnCity.hourly, city.tz, now) : []);
+    // Only the Open-Meteo hourly feeds observedFromHourly (unchanged behaviour); WN p50 is never "observed".
+    const pastHours = (prev?.hourly ?? []).filter((h) => Date.parse(h.time) <= now);
     const observedFromHourly = pastHours.length ? Math.max(...pastHours.map((h) => h.tempC)) : null;
     const metarC = metar?.temp ?? null;
     const currentC = metarC ?? prev?.currentC ?? (hourly[0]?.tempC ?? null);
     const observedMaxC = [observedFromHourly, metarC, currentC]
       .filter((n): n is number => n != null)
       .reduce((a, b) => Math.max(a, b), -Infinity);
-    const membersByDate: Record<string, number[]> = {};
-    const prefix = `${city.id}:`;
-    for (const [key, val] of ensemble.map.entries()) {
-      if (key.startsWith(prefix)) {
-        membersByDate[key.slice(prefix.length)] = val.members;
+    // One provider per city (never mix members across providers for a date).
+    const membersByDate: Record<string, number[]> = wnCity ? { ...wnCity.membersByDate } : {};
+    if (!wnCity) {
+      const prefix = `${city.id}:`;
+      for (const [key, val] of ensemble.map.entries()) {
+        if (key.startsWith(prefix)) {
+          membersByDate[key.slice(prefix.length)] = val.members;
+        }
       }
     }
     const localDate = new Intl.DateTimeFormat("en-CA", { timeZone: city.tz }).format(new Date());
     // Quant: never ens.members / dates[0] fallback.
     const members = membersByDate[localDate] ?? [];
-    const hasEnsemble = Object.values(membersByDate).some((m) => m.length >= 8);
+    const hasEnsemble = !wnCity && Object.values(membersByDate).some((m) => m.length >= 8);
     const sources = [
+      wnCity ? weatherNextSourceLabel(wnCity.init) : null,
       hasEnsemble ? "Open-Meteo ensemble" : null,
       prev ? "Open-Meteo forecast" : null,
       metar ? `METAR ${city.icao}` : null,
@@ -341,6 +368,25 @@ export async function loadWeather(cities: CityMeta[]): Promise<Record<string, We
   }
 
   return out;
+}
+
+function localHourly(points: HourPoint[], tz: string, now: number): HourPoint[] {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz || "UTC",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  });
+  return points
+    .filter((h) => Date.parse(h.time) > now - 3600_000)
+    .slice(0, 48)
+    .map((h) => {
+      const p = Object.fromEntries(fmt.formatToParts(new Date(h.time)).map((x) => [x.type, x.value]));
+      return { time: `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}`, tempC: h.tempC };
+    });
 }
 
 async function loadPrevious(cities: CityMeta[]) {
