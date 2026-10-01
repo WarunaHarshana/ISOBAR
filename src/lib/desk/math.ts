@@ -49,11 +49,21 @@ export function kdeMass(members: number[], lo: number, hi: number, bandwidth: nu
   return acc / members.length;
 }
 
-export function leadSigmaC(eventDate: string, now = new Date()) {
-  const today = now.toISOString().slice(0, 10);
+/** Calendar date (YYYY-MM-DD) in tz. */
+export function localDateIn(tz: string | undefined, now = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: tz || "UTC" }).format(now);
+}
+
+/**
+ * Extra forecast-error width (°C) by lead time, measured in the CITY's local
+ * calendar (events are local dates; the old UTC date was off by a day for
+ * much of the day in Asia/Pacific and the Americas).
+ */
+export function leadSigmaC(eventDate: string, now = new Date(), tz?: string) {
+  const today = localDateIn(tz, now);
   if (eventDate <= today) return 0.55;
-  const days = Math.max(0, (Date.parse(`${eventDate}T12:00:00Z`) - now.getTime()) / 86_400_000);
-  return 0.7 + Math.min(days, 5) * 0.35;
+  const days = Math.round((Date.parse(`${eventDate}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86_400_000);
+  return 0.7 + Math.min(Math.max(days, 0), 5) * 0.35;
 }
 
 export function adjustMembersForObserved(members: number[], observedC: number | null) {
@@ -68,11 +78,13 @@ export function bucketProbability(
   unit: TempUnit,
   eventDate: string,
   observedC: number | null,
+  tz?: string,
+  now = new Date(),
 ) {
   const adjusted = adjustMembersForObserved(membersC, observedC);
   if (!adjusted.length) return 0;
   const converted = adjusted.map((c) => convertTemp(c, unit));
-  const bandwidth = Math.max(stdev(converted) * 0.45, unit === "F" ? 1.1 : 0.65, leadSigmaC(eventDate) * (unit === "F" ? 1.8 : 1));
+  const bandwidth = Math.max(stdev(converted) * 0.45, unit === "F" ? 1.1 : 0.65, leadSigmaC(eventDate, now, tz) * (unit === "F" ? 1.8 : 1));
   let mass = kdeMass(converted, lo, hi, bandwidth);
   if (observedC != null) {
     const obs = convertTemp(observedC, unit);

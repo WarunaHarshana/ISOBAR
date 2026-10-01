@@ -20,6 +20,15 @@ export function membersForEvent(wx: WeatherNow | undefined, eventDate: string): 
   return Array.isArray(dated) ? dated : [];
 }
 
+/**
+ * Observed daily max usable for a signal: only HIGH markets, only when the
+ * signal's date is the city's current local date (never today's obs for tomorrow).
+ */
+export function observedForSignal(wx: WeatherNow | undefined, sig: { date: string; kind: string }): number | null {
+  if (!wx || sig.kind !== "high" || wx.localDate !== sig.date) return null;
+  return wx.observedMaxC ?? null;
+}
+
 function weatherHasDatedEnsemble(w: WeatherNow | undefined) {
   if (!w) return false;
   return Object.values(w.membersByDate ?? {}).some((m) => ensembleOk(m));
@@ -71,13 +80,15 @@ export function assembleDeskSnapshot(opts: {
   for (const ev of events) {
     const wx = weather[ev.city.id];
     const members = membersForEvent(wx, ev.eventDate);
-    const enough = ensembleOk(members);
+    // Members are daily-MAX distributions: never price "lowest temperature" events with them.
+    const enough = ev.kind === "high" && ensembleOk(members);
     const isLiveDay = wx?.localDate === ev.eventDate;
     const dayEnded = Boolean(wx?.localDate && wx.localDate > ev.eventDate);
-    const observedC = isLiveDay ? (wx?.observedMaxC ?? null) : null;
+    // Observed daily max only conditions HIGH markets on the city's current local day.
+    const observedC = isLiveDay && ev.kind === "high" ? (wx?.observedMaxC ?? null) : null;
     const buckets: MarketBucket[] = ev.markets.map((m) => {
       const modelPRaw = enough
-        ? bucketProbability(members, m.bound.lo, m.bound.hi, ev.unit, ev.eventDate, observedC)
+        ? bucketProbability(members, m.bound.lo, m.bound.hi, ev.unit, ev.eventDate, observedC, ev.city.tz)
         : 0;
       let modelP = modelPRaw;
       if (enough && observedC != null && Number.isFinite(m.bound.hi)) {

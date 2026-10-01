@@ -1,5 +1,5 @@
 import { cached, fetchJson } from "./cache";
-import { parseEventTitle, parseJsonArray, parseNumber, parseBucket, detectUnit } from "./parse";
+import { parseEventTitle, parseJsonArray, parseNumber, parseBucket, detectUnit, settlementRule, type SettlementRule } from "./parse";
 import { resolveCity, unknownCity } from "./cities";
 import type { CityMeta } from "./types";
 
@@ -9,6 +9,7 @@ export type RawMarket = {
   slug?: string;
   conditionId?: string;
   groupItemTitle?: string;
+  description?: string;
   outcomePrices?: string | string[];
   outcomes?: string | string[];
   bestBid?: number | null;
@@ -25,6 +26,7 @@ export type RawEvent = {
   id: string;
   title: string;
   slug: string;
+  description?: string;
   eventDate?: string;
   endDate?: string;
   volume?: number;
@@ -50,6 +52,8 @@ export type ParsedEvent = {
   liquidity: number;
   image: string | null;
   context: string | null;
+  /** How the resolution source rounds the settled number (see parse.ts). */
+  settlement: SettlementRule;
   markets: Array<
     RawMarket & {
       bound: NonNullable<ReturnType<typeof parseBucket>>;
@@ -74,10 +78,11 @@ export async function loadWeatherEvents(): Promise<ParsedEvent[]> {
     const parsed = parseEventTitle(event.title ?? "");
     if (!parsed) continue;
     const markets: ParsedEvent["markets"] = [];
+    const settlement = settlementRule(event.description || event.markets?.[0]?.description);
     let unit: "C" | "F" = "C";
     for (const m of event.markets ?? []) {
       if (m.closed) continue;
-      const bound = parseBucket(m.question ?? "", m.groupItemTitle);
+      const bound = parseBucket(m.question ?? "", m.groupItemTitle, settlementRule(m.description || event.description));
       if (!bound) continue;
       unit = detectUnit(m.question ?? "");
       const prices = parseJsonArray(m.outcomePrices).map(Number);
@@ -108,6 +113,7 @@ export async function loadWeatherEvents(): Promise<ParsedEvent[]> {
       liquidity: parseNumber(event.liquidity),
       image: event.image ?? null,
       context: event.eventMetadata?.context_description ?? null,
+      settlement,
       markets,
     });
   }

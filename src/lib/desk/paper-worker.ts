@@ -1,5 +1,5 @@
 import { fetchJson } from "./cache";
-import { buildDeskSnapshot } from "./snapshot";
+import { buildDeskSnapshot, observedForSignal } from "./snapshot";
 import type { PaperFill } from "./types";
 import {
   PAPER_MAX_FILLS_PER_TICK,
@@ -139,7 +139,8 @@ export async function tickPaperWorker(): Promise<PaperBook> {
           bestBid: bucket?.bestBid ?? null,
           bestAsk: bucket?.bestAsk ?? null,
           members,
-          observedC: wx?.observedMaxC ?? null,
+          // Today's observed max only applies to today's (local) event, never to future dates.
+          observedC: observedForSignal(wx, sig),
           lo: bucket?.lo,
           hi: bucket?.hi,
         });
