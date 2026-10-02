@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -48,6 +48,7 @@ const cfg: WeatherNextConfig = {
   monthlyCapBytes: 270 * 1024 ** 3,
   maxEstimateBytes: 28 * 1024 ** 3,
   usageFile: null,
+  cacheFile: null,
 };
 
 const MIB = 1024 ** 2;
@@ -261,17 +262,20 @@ describe("WeatherNext SQL + config", () => {
     const base = { ISOBAR_WEATHERNEXT_PROJECT: "p", ISOBAR_WEATHERNEXT_DATASET: "d" };
     assert.equal(weatherNextConfig(base)!.maxEstimateBytes, 28 * 1024 ** 3);
     assert.equal(weatherNextConfig({ ...base, ISOBAR_WEATHERNEXT_MAX_ESTIMATE_GIB: "2048" })!.maxEstimateBytes, 2048 * 1024 ** 3);
-    assert.equal(weatherNextConfig(base)!.dailyCapBytes, 20 * 1024 ** 3);
-    assert.equal(weatherNextConfig(base)!.monthlyCapBytes, 600 * 1024 ** 3);
+    assert.equal(weatherNextConfig(base)!.dailyCapBytes, 40 * 1024 ** 3);
+    assert.equal(weatherNextConfig(base)!.monthlyCapBytes, 1200 * 1024 ** 3);
+    assert.equal(weatherNextConfig({ ...base, ISOBAR_WEATHERNEXT_MONTHLY_GIB: "2000" })!.monthlyCapBytes, 2000 * 1024 ** 3);
+    assert.equal(weatherNextConfig({ ...base, ISOBAR_DATA_DIR: "/x" })!.cacheFile, "/x/weathernext-cache.json");
+    assert.equal(weatherNextConfig({ ...base, ISOBAR_DATA_DIR: "/x" })!.usageFile, "/x/weathernext-usage.json");
     assert.deepEqual(weatherNextConfig(base)!.initHours, [0, 12]);
   });
 
-  it("pre-flight estimate covers the measured ~196 MiB/city bill; 2 full 47-city inits fit the default caps", () => {
+  it("pre-flight estimate covers the measured ~196 MiB/city bill; 2 full 48-city inits (+ slack) fit the default caps", () => {
     assert.equal(EST_BYTES_PER_CITY, 200 * MIB);
     const c = weatherNextConfig({ ISOBAR_WEATHERNEXT_PROJECT: "p", ISOBAR_WEATHERNEXT_DATASET: "d" })!;
-    const perInit = 47 * EST_BYTES_PER_CITY;
-    assert.ok(2 * perInit <= c.dailyCapBytes, "00Z + 12Z fit the daily cap");
-    assert.ok(31 * 2 * perInit <= c.monthlyCapBytes, "a 31-day month of 2 inits/day fits the monthly cap");
+    const perInit = 48 * EST_BYTES_PER_CITY;
+    assert.ok(4 * perInit <= c.dailyCapBytes, "00Z + 12Z fit the daily cap twice over");
+    assert.ok(31 * 4 * perInit <= c.monthlyCapBytes, "a 31-day month of 2 inits/day fits the monthly cap twice over");
   });
 
   it("weatherNextConfig: off unless project + dataset set; parses JSON / base64 creds", () => {
@@ -483,6 +487,184 @@ describe("loadWeatherNext caching + budget (mocked BigQuery)", () => {
     const a = await loadWeatherNext([nyc]);
     assert.equal(a.configured, false);
     assert.equal(calls.length, 0);
+  });
+});
+
+describe("WeatherNext persistence + init switching (mocked BigQuery)", () => {
+  let dir: string;
+  let cacheFile: string;
+  let usageFile: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "wn-cache-"));
+    cacheFile = join(dir, "weathernext-cache.json");
+    usageFile = join(dir, "weathernext-usage.json");
+    _setWeatherNextConfig({ ...cfg, cacheFile, usageFile, dailyCapBytes: 40 * 1024 ** 3, monthlyCapBytes: 1200 * 1024 ** 3 });
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  const many = (n: number): CityMeta[] =>
+    Array.from({ length: n }, (_, i) => ({ ...nyc, id: `c${i}`, lat: 10 + i * 0.5, lon: 10 + i * 0.5 }));
+  /** Simulate a process restart: in-memory state gone, files on disk kept. */
+  const restart = () => _resetWeatherNext();
+  const quiet = async <T,>(fn: () => Promise<T>) => {
+    const w = console.warn;
+    const l = console.log;
+    console.warn = () => {};
+    console.log = () => {};
+    try {
+      return await fn();
+    } finally {
+      console.warn = w;
+      console.log = l;
+    }
+  };
+
+  it("persists the loaded init atomically; a restart serves it from disk with zero BigQuery jobs", async () => {
+    runnerFor(defaultHandler());
+    const a = await quiet(() => loadWeatherNext([nyc, tokyo]));
+    assert.equal(calls.length, 1);
+    assert.ok(existsSync(cacheFile));
+    assert.deepEqual(readdirSync(dir).filter((f) => f.includes(".tmp")), [], "no tmp file left behind");
+    const disk = JSON.parse(readFileSync(cacheFile, "utf8"));
+    assert.equal(disk.version, 1);
+    assert.equal(disk.init, latestInit());
+    assert.equal(disk.table, cfg.table);
+    assert.equal(disk.maxHours, cfg.maxHours);
+    assert.deepEqual(Object.keys(disk.cities).sort(), ["nyc", "tokyo"]);
+    assert.equal(disk.cities.nyc.reqLat, nyc.lat);
+    const usedBefore = weatherNextUsage()!.dayBytes;
+
+    restart();
+    calls = [];
+    dryCalls = [];
+    const b = await quiet(() => loadWeatherNext([nyc, tokyo]));
+    assert.equal(calls.length, 0, "no billed job after restart");
+    assert.equal(dryCalls.length, 0, "not behind → not even a dry-run probe");
+    assert.equal(b.init, a.init);
+    assert.deepEqual(b.byCity.get("nyc"), a.byCity.get("nyc"));
+    // usage counter survived the restart too
+    assert.equal(weatherNextUsage()!.dayBytes, usedBefore);
+  });
+
+  it("usage counter is persisted and caps survive a restart", async () => {
+    const day = new Date().toISOString().slice(0, 10);
+    writeFileSync(usageFile, JSON.stringify({ day, dayBytes: 40 * 1024 ** 3 - 100 * MIB, month: day.slice(0, 7), monthBytes: 50 * 1024 ** 3 }));
+    runnerFor(defaultHandler());
+    const a = await quiet(() => loadWeatherNext([nyc]));
+    assert.equal(calls.length, 0, "persisted usage leaves < 200 MiB → no job");
+    assert.equal(a.byCity.size, 0);
+  });
+
+  it("an invalid or mismatched cache file is ignored and the init is fetched", async () => {
+    writeFileSync(cacheFile, "{not json");
+    runnerFor(defaultHandler());
+    await quiet(() => loadWeatherNext([nyc]));
+    assert.equal(calls.length, 1);
+    // table mismatch → ignored
+    const disk = JSON.parse(readFileSync(cacheFile, "utf8"));
+    writeFileSync(cacheFile, JSON.stringify({ ...disk, table: "other_table" }));
+    restart();
+    calls = [];
+    await quiet(() => loadWeatherNext([nyc]));
+    assert.equal(calls.length, 1);
+  });
+
+  it("a city whose coordinates changed is refetched; others stay cached", async () => {
+    runnerFor(defaultHandler());
+    await quiet(() => loadWeatherNext([nyc, tokyo]));
+    restart();
+    calls = [];
+    const moved = { ...tokyo, lat: 35.7, lon: 139.7 };
+    const b = await quiet(() => loadWeatherNext([nyc, moved]));
+    assert.equal(calls.length, 1);
+    assert.match(calls[0].sql, /139\.7000 35\.7000/);
+    assert.ok(!calls[0].sql.includes("-73.9654"));
+    assert.equal(b.byCity.size, 2);
+  });
+
+  /** Load `older` (the previous due init) into the cache, then publish `latest`. */
+  async function onOlderInit(n: number) {
+    const [newest, older] = dueInitCandidates(Date.now(), cfg.initHours).map((d) => d.toISOString());
+    let published = older;
+    runnerFor(
+      (sql) => defaultHandler(sqlInit(sql)!)(sql),
+      FETCH_BATCH_SIZE * 196 * MIB,
+      { published: (i) => (Date.parse(i) <= Date.parse(published) ? PARTITION_BYTES : 0) },
+    );
+    const cities = many(n);
+    const a = await quiet(() => loadWeatherNext(cities));
+    assert.equal(a.init, older);
+    assert.equal(a.byCity.size, n);
+    published = newest;
+    restart(); // also clears lastProbeAt so the next call probes
+    calls = [];
+    dryCalls = [];
+    return { newest, older, cities };
+  }
+
+  it("new init whose full pass does not fit the remaining budget → keep serving the cached older init, no billed job", async () => {
+    const n = FETCH_BATCH_SIZE * 3;
+    const { older, cities } = await onOlderInit(n);
+    const used = JSON.parse(readFileSync(usageFile, "utf8")).dayBytes;
+    // room for 2 of 3 batches: the old code would have started a partial pass
+    _setWeatherNextConfig({ ...cfg, cacheFile, usageFile, dailyCapBytes: used + 2 * FETCH_BATCH_SIZE * EST_BYTES_PER_CITY, monthlyCapBytes: 1200 * 1024 ** 3 });
+    const warns: string[] = [];
+    const b = await quiet(async () => {
+      console.warn = (...x: unknown[]) => void warns.push(x.join(" "));
+      return loadWeatherNext(cities);
+    });
+    assert.equal(calls.length, 0, "no billed job for the unaffordable new init");
+    assert.ok(dryCalls.length >= 1 && dryCalls.every((c) => isProbe(c.sql)), "only free probes");
+    assert.equal(b.init, older);
+    assert.equal(b.byCity.size, n);
+    assert.equal(b.error, null);
+    assert.ok(warns.some((x) => /keeping cached init/.test(x)));
+    assert.equal(JSON.parse(readFileSync(cacheFile, "utf8")).init, older);
+  });
+
+  it("new init whose full pass fits → switches and re-persists", async () => {
+    const n = FETCH_BATCH_SIZE * 3;
+    const { newest, cities } = await onOlderInit(n);
+    const b = await quiet(() => loadWeatherNext(cities));
+    assert.equal(calls.length, 3);
+    assert.equal(b.init, newest);
+    for (const c of b.byCity.values()) assert.equal(c.init, newest);
+    assert.equal(JSON.parse(readFileSync(cacheFile, "utf8")).init, newest);
+    // and a restart after the switch is free again
+    restart();
+    calls = [];
+    dryCalls = [];
+    const c = await quiet(() => loadWeatherNext(cities));
+    assert.equal(calls.length + dryCalls.length, 0);
+    assert.equal(c.init, newest);
+  });
+
+  it("no usable older init (cache > 30 h old) → partial load under the cap is still allowed", async () => {
+    const stale = new Date(Date.now() - 40 * 3600_000);
+    stale.setUTCHours(0, 0, 0, 0);
+    const city = { init: stale.toISOString(), gridLat: 0, gridLon: 0, membersByDate: {}, hourly: [], reqLat: 0, reqLon: 0 };
+    const cities = many(FETCH_BATCH_SIZE * 3);
+    writeFileSync(
+      cacheFile,
+      JSON.stringify({
+        version: 1,
+        savedAt: stale.toISOString(),
+        init: stale.toISOString(),
+        datasetProject: cfg.datasetProject,
+        dataset: cfg.dataset,
+        table: cfg.table,
+        maxHours: cfg.maxHours,
+        cities: Object.fromEntries(cities.map((c) => [c.id, { ...city, reqLat: c.lat, reqLon: c.lon }])),
+        empty: [],
+      }),
+    );
+    _setWeatherNextConfig({ ...cfg, cacheFile, usageFile, dailyCapBytes: 2 * FETCH_BATCH_SIZE * EST_BYTES_PER_CITY, monthlyCapBytes: 1200 * 1024 ** 3 });
+    runnerFor(defaultHandler(), FETCH_BATCH_SIZE * 196 * MIB);
+    const a = await quiet(() => loadWeatherNext(cities));
+    assert.equal(calls.length, 2, "partial pass: 2 of 3 batches");
+    assert.equal(a.byCity.size, FETCH_BATCH_SIZE * 2, "stale fallback rows are not served");
+    assert.equal(a.init, latestInit());
+    assert.equal(JSON.parse(readFileSync(cacheFile, "utf8")).init, latestInit());
   });
 });
 

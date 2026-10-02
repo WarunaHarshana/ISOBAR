@@ -38,7 +38,7 @@ Unset → the desk uses the Open-Meteo ensemble exactly as before.
 | `ISOBAR_WEATHERNEXT_INIT_HOURS` | UTC inits to use, default `0,12` (subset of `0,6,12,18`). |
 | `ISOBAR_WEATHERNEXT_PROBE_MIN` | Min minutes between "new init yet?" probes, default `30`. Probes only run while a due init is missing. |
 | `ISOBAR_WEATHERNEXT_MAX_HOURS` | Lead hours kept, default `120`. |
-| `ISOBAR_WEATHERNEXT_DAILY_GIB` / `ISOBAR_WEATHERNEXT_MONTHLY_GIB` | Hard byte caps (billed bytes), default `20` / `600` GiB. Counter persisted to `${ISOBAR_DATA_DIR}/weathernext-usage.json`. Over cap → keep last init (≤30 h) or fall back to Open-Meteo. |
+| `ISOBAR_WEATHERNEXT_DAILY_GIB` / `ISOBAR_WEATHERNEXT_MONTHLY_GIB` | Hard byte caps (billed bytes), default `40` / `1200` GiB. Counter persisted (atomically) to `${ISOBAR_DATA_DIR}/weathernext-usage.json`, so caps survive restarts. Over cap → keep last init (≤30 h) or fall back to Open-Meteo. |
 | `ISOBAR_WEATHERNEXT_MAX_ESTIMATE_GIB` | Pre-run limit, default `28`. Every billed job is dry-run first; if BigQuery's estimate is above this the job is not started (back off 1 h, Open-Meteo fallback). Keep it below the project's `QueryUsagePerDay` custom quota. |
 | `ISOBAR_WEATHERNEXT_DISABLED` | `true` = kill switch. |
 
@@ -57,13 +57,25 @@ real hour-to-hour correlation is slightly below 1, so it is a small low bias on 
 emitted when the init covers local 11:00–23:00; otherwise that date has no members and is not traded.
 
 Cost: point lookups are pruned by geography clustering, so the bill ≈ 196 MiB per city per init (4 columns; measured in
-production: ~9 GiB per full 47-city init). The
+production: ~9.2 GiB per full 48-city init). The
 "new init?" probe is a dry run (`SELECT init_time … WHERE init_time = <init>`; estimate > 0 ⇔ published), so it is free.
-Fetches run in batches of 8 cities. `0,12` inits × 47 cities ≈ 18 GiB/day ≈ 540 GiB/month worst case, capped at
-20 GiB/day and 600 GiB/month (inside the 1 TiB/month free tier). The caps count **billed** bytes (`totalBytesBilled`,
-min 10 MiB/job); every batch is pre-flight checked at 200 MiB/city against both the daily and monthly cap, so a batch
-never starts if it could cross either cap. If the cap is hit mid-pass the cities already fetched are kept (partial
-load) and the rest are filled from the same init once budget frees up; uncovered cities use Open-Meteo meanwhile.
+Fetches run in batches of 8 cities. `0,12` inits × 48 cities ≈ 19 GiB/day ≈ 580 GiB/month, capped at
+40 GiB/day and 1200 GiB/month (2× headroom; above the 1 TiB/month free tier only in a worst case, paid from GCP credit).
+The caps count **billed** bytes (`totalBytesBilled`, min 10 MiB/job); every batch is pre-flight checked at
+200 MiB/city against both the daily and monthly cap, so a batch never starts if it could cross either cap.
+
+Init cache (restarts/deploys do not re-bill): the loaded init's per-city rows (50 daily-max members per local date,
+hourly p50, grid cell, requested lat/lon) plus the init time and metadata (dataset/table, `maxHours`, savedAt, cities
+with no cell) are written atomically (tmp + rename) to `${ISOBAR_DATA_DIR}/weathernext-cache.json` after every fetched
+batch, and loaded on startup when its version/table/`maxHours` match. Only inits newer than the cached one are fetched;
+a city whose coordinates changed is refetched. Look for `WeatherNext init … loaded from cache … (no BigQuery job)` in
+the logs.
+
+Switching inits: a newer init is fetched only if the **full pass** for every city (200 MiB × cities, ~9.4 GiB for 48)
+fits the remaining daily *and* monthly budget; otherwise the older cached init keeps serving (log: `keeping cached
+init`) until budget frees up (next UTC day) or it goes stale (>30 h). Only when there is no usable older init is a
+partial load allowed: then the cities fetched before a cap are kept and the rest are filled from the same init once
+budget frees up; uncovered cities use Open-Meteo meanwhile.
 
 **Estimate ≠ bill.** BigQuery's pre-run estimate ignores clustering: it is the whole init_time partition for every
 selected column (0.05° view, measured 2026-10-01: init_time only ≈ 1.2–5 GB, init_time+geography ≈ 21 GB, the 4
