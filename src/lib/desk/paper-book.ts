@@ -75,7 +75,18 @@ export const PAPER_FAVORITE_GUARD_MODELP = 0.5;
 export const PAPER_KELLY = 0.12;
 export const PAPER_MAX_POS = 0.08;
 export const PAPER_MAX_FILLS_PER_TICK = 4;
-export const PAPER_MAX_OPEN = 8;
+export const PAPER_DEFAULT_MAX_OPEN = 1_000_000;
+/**
+ * Open-ticket guard. The default is effectively unlimited relative to the $5
+ * minimum stake and $10k bankroll, but remains configurable for operational
+ * experiments without a code change.
+ */
+export function paperMaxOpen(env = process.env): number {
+  const raw = env.ISOBAR_PAPER_MAX_OPEN;
+  const parsed = raw == null || raw.trim() === "" ? NaN : Number(raw);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : PAPER_DEFAULT_MAX_OPEN;
+}
+export const PAPER_MAX_OPEN = paperMaxOpen();
 export const PAPER_MAX_OPEN_PER_EVENT = 1;
 /** One ticket per city-date (no YES+NO hedges or two YESes on one city). */
 export const PAPER_MAX_OPEN_PER_CITY_DATE = 1;
@@ -423,7 +434,7 @@ export function paperTrade(
   if (liveTradingLocked()) return null;
 
   const open = fills.filter((f) => f.status === "open");
-  if (open.length >= PAPER_MAX_OPEN) return null;
+  if (open.length >= paperMaxOpen()) return null;
   if (open.some((f) => f.marketId === signal.marketId && f.side === signal.side)) return null;
   if (open.filter((f) => f.eventId === signal.eventId).length >= PAPER_MAX_OPEN_PER_EVENT) return null;
   if (

@@ -7,7 +7,9 @@ import {
   PAPER_MIN_EDGE,
   PAPER_MIN_PRICE,
   PAPER_MAX_PRICE,
+  PAPER_DEFAULT_MAX_OPEN,
   PAPER_MAX_OPEN,
+  paperMaxOpen,
   PAPER_MAX_OPEN_PER_EVENT,
   PAPER_MAX_OPEN_PER_CITY_DATE,
   PAPER_MIN_STAKE,
@@ -75,7 +77,7 @@ const savedEnv: Record<string, string | undefined> = {};
 
 beforeEach(() => {
   dataDir = mkdtempSync(join(tmpdir(), "isobar-paper-"));
-  for (const k of ["ISOBAR_DATA_DIR", "ISOBAR_LIVE", "ISOBAR_PAPER_ARMED", "PRIVATE_KEY", "POLYMARKET_PRIVATE_KEY"]) {
+  for (const k of ["ISOBAR_DATA_DIR", "ISOBAR_LIVE", "ISOBAR_PAPER_ARMED", "ISOBAR_PAPER_MAX_OPEN", "PRIVATE_KEY", "POLYMARKET_PRIVATE_KEY"]) {
     savedEnv[k] = process.env[k];
     delete process.env[k];
   }
@@ -150,10 +152,15 @@ describe("sizing", () => {
 
 describe("caps", () => {
   it("enforces open/event/city-date caps", () => {
-    const fills = Array.from({ length: PAPER_MAX_OPEN }, (_, i) =>
+    process.env.ISOBAR_PAPER_MAX_OPEN = "1";
+    assert.equal(paperMaxOpen(), 1);
+    const fills = Array.from({ length: paperMaxOpen() }, (_, i) =>
       openFill({ id: `o${i}`, marketId: `mx${i}`, eventId: `evx${i}`, cityId: `c${i}` }),
     );
+    assert.equal(PAPER_DEFAULT_MAX_OPEN, 1_000_000);
+    assert.equal(PAPER_MAX_OPEN, PAPER_DEFAULT_MAX_OPEN);
     assert.equal(paperTrade(signal({ marketId: "n", eventId: "n", cityId: "n" }), { ...emptyBook(), fills }), null);
+    delete process.env.ISOBAR_PAPER_MAX_OPEN;
     assert.equal(paperTrade(signal({ eventId: "ev1", marketId: "m2" }), { ...emptyBook(), fills: [openFill()] }), null);
     assert.equal(PAPER_MAX_OPEN_PER_EVENT, 1);
     assert.equal(PAPER_MAX_OPEN_PER_CITY_DATE, 1);

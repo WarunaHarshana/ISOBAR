@@ -24,6 +24,7 @@ The desk UI polls `getPaperBookFn` on a short interval (see `usePaperBookQuery` 
 | `VITE_AUTH_ENABLED` | Keep `false` for the desk |
 | `ISOBAR_LIVE` / private keys | If set, worker **refuses to arm** |
 | `ISOBAR_PAPER_MIN_PRICE_YES` | YES floor (ask), default 0.12 (model-params.ts) |
+| `ISOBAR_PAPER_MAX_OPEN` | Open-ticket guard; default 1,000,000 (effectively unlimited at the paper bankroll/minimum stake) |
 | `ISOBAR_TAKER_FEE_RATE` | Taker fee rate, default 0.05 (fee = rate·p·(1−p) per share) |
 | `ISOBAR_BLEND_AHEAD` / `ISOBAR_BLEND_SAMEDAY` | Model weight w for D-1+ / live-day knots `"hour:w,…"` (default 0 / `10:0,13:0.5,16:0.75`) |
 | `ISOBAR_BLEND_DISABLED` / `ISOBAR_STATION_BIAS_DISABLED` | `true` → raw model (w = 1) / no station correction |
@@ -162,7 +163,7 @@ priced from the time of day, not just floored by the observation:
 
 - Min edge 6¢ **net of the taker fee**; NO 5–85¢; YES 12–85¢ (`ISOBAR_PAPER_MIN_PRICE_YES`, was 3¢)
 - 0.12 Kelly, max 8% cash per fill
-- Max 4 fills/tick, 8 open, 1/event, **1/city-date**
+- Max 4 fills/tick, configurable open-ticket guard (default effectively unlimited; `ISOBAR_PAPER_MAX_OPEN`), 1/event, **1/city-date**
 - Near-certainty gate: YES only on the modal bucket (highest modelP ≥ 20 %) with a raw ensemble member within one
   KDE bandwidth (KDE tail mass is not support). Live day: YES bucket at most 2.5 °C / 4.5 °F past the observed
   extreme. NO only if no member is near the bucket, the observation is not in it, its mid is ≥ 5 °C / 9 °F from the
