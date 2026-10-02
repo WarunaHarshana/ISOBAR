@@ -199,3 +199,187 @@ export function impliedTemp(buckets: { lo: number; hi: number; yesPrice: number 
   if (den < 0.2) return null;
   return num / den;
 }
+
+// ---------------------------------------------------------------------------
+// Live-day (intraday) conditioning
+// ---------------------------------------------------------------------------
+
+/** Local hour (fractional, 0–24) in tz. */
+export function localHourIn(tz: string | undefined, now = new Date()) {
+  const p = Object.fromEntries(
+    new Intl.DateTimeFormat("en-CA", { timeZone: tz || "UTC", hour: "2-digit", minute: "2-digit", hourCycle: "h23" })
+      .formatToParts(now)
+      .map((x) => [x.type, x.value]),
+  );
+  return (Number(p.hour) % 24) + Number(p.minute) / 60;
+}
+
+/**
+ * Daily-high warming window: by HIGH_PEAK_END_H local the day's max is normally in
+ * (mid-afternoon peak); the ensemble's full daily-max spread applies before
+ * HIGH_WINDOW_START_H and shrinks linearly to the remaining-hours forecast at the end.
+ * With today's hourly forecast the window ends two hours after its forecast peak
+ * (clamped to 13–18 h; lows: one hour after the forecast trough before noon, 4–10 h).
+ */
+export const HIGH_WINDOW_START_H = 6;
+export const HIGH_PEAK_END_H = 17;
+/** Daily-low cooling window: the min is normally set by LOW_TROUGH_END_H local (pre-dawn/dawn). */
+export const LOW_TROUGH_END_H = 8;
+/** Floor on the remaining-hours error σ (°C): METAR rounding + residual forecast error. */
+export const INTRADAY_MIN_SIGMA_C = 0.5;
+/** Clamp on the bias between the latest METAR and the hourly forecast for that hour (°C). */
+export const INTRADAY_MAX_BIAS_C = 4;
+
+export type IntradayInput = {
+  kind: TempKind;
+  /** Observed extreme so far today at the settlement station (°C): max for high, min for low. */
+  observedC: number;
+  /** Latest METAR temperature (°C) and its time, for the forecast-bias correction. */
+  latestObsC?: number | null;
+  latestObsAt?: string | number | null;
+  /** Hourly forecast, local wall-clock "YYYY-MM-DDTHH:MM" (Open-Meteo forecast or WeatherNext p50). */
+  hourly?: { time: string; tempC: number }[];
+  localDate: string;
+  tz?: string;
+  now?: Date;
+};
+
+export type IntradayModel = {
+  kind: TempKind;
+  observedC: number;
+  /** Remaining-extreme samples (°C), one per member, before the max/min with observedC. */
+  samplesC: number[];
+  /** Gaussian σ (°C) around each sample. */
+  sigmaC: number;
+  /** Fraction of the warming (high) / cooling (low) window still ahead, 0–1. */
+  remainingFrac: number;
+  localHour: number;
+  /** Bias-corrected max (high) / min (low) of the remaining hours of the hourly forecast; null if none. */
+  remainingFcC: number | null;
+  biasC: number;
+  centerC: number;
+};
+
+function hourOfLocal(time: string) {
+  const h = Number(time.slice(11, 13));
+  return Number.isFinite(h) ? h : NaN;
+}
+
+/**
+ * Condition the daily extreme on the time of day:
+ *   final = max(observedMax, X)   (high)    final = min(observedMin, X)   (low)
+ *   X_i ~ N(c + (m_i − mean)·√f, σ),  c = f·mean + (1 − f)·target,  σ = max(0.5 °C, bw·√f)
+ * where f is the fraction of the warming/cooling window still ahead, m_i are the
+ * ensemble daily extremes and target is the bias-corrected max/min of the remaining
+ * hours of the hourly forecast (or the observed extreme when no hourly forecast).
+ * Early in the day (f = 1) this is the ensemble as-is; after the peak (f = 0) the
+ * distribution collapses on the observed extreme with only the upside that the rest
+ * of the day's forecast supports.
+ */
+export function intradayModel(membersC: number[], input: IntradayInput, bandwidthC: number): IntradayModel {
+  const now = input.now ?? new Date();
+  const H = localHourIn(input.tz, now);
+  const high = input.kind !== "low";
+  const today = (input.hourly ?? []).filter((p) => p.time.slice(0, 10) === input.localDate && Number.isFinite(p.tempC));
+  // End of the warming (cooling) window: two hours after the hourly forecast's own peak (one after the trough)
+  // when today's hourly forecast is available, else the climatological default.
+  let windowEnd = high ? HIGH_PEAK_END_H : LOW_TROUGH_END_H;
+  if (today.length >= 12) {
+    const pool = high ? today : today.filter((p) => hourOfLocal(p.time) <= 12);
+    if (pool.length) {
+      const ext = pool.reduce((a, b) => (high ? (b.tempC > a.tempC ? b : a) : b.tempC < a.tempC ? b : a));
+      const h = hourOfLocal(ext.time) + (high ? 2 : 1);
+      if (Number.isFinite(h)) windowEnd = high ? Math.min(18, Math.max(13, h)) : Math.min(10, Math.max(4, h));
+    }
+  }
+  const f = high
+    ? clamp01((windowEnd - H) / (windowEnd - HIGH_WINDOW_START_H))
+    : clamp01((windowEnd - H) / windowEnd);
+  // Forecast bias, from (a) the latest METAR vs the forecast for that local hour (report ≤ 3 h old)
+  // and (b) the observed extreme so far vs the forecast extreme over the same elapsed hours.
+  // The mean of the available estimates, clamped.
+  const biases: number[] = [];
+  if (input.latestObsC != null && Number.isFinite(input.latestObsC) && input.latestObsAt != null) {
+    const at = typeof input.latestObsAt === "number" ? input.latestObsAt : Date.parse(input.latestObsAt);
+    if (Number.isFinite(at) && now.getTime() - at <= 3 * 3600_000 && at <= now.getTime() + 60_000) {
+      const obsDate = localDateIn(input.tz, new Date(at));
+      const obsHour = Math.floor(localHourIn(input.tz, new Date(at)) + 0.5) % 24;
+      const fc = today.find((p) => obsDate === input.localDate && hourOfLocal(p.time) === obsHour);
+      if (fc) biases.push(input.latestObsC - fc.tempC);
+    }
+  }
+  const elapsed = today.filter((p) => hourOfLocal(p.time) <= H).map((p) => p.tempC);
+  if (elapsed.length) biases.push(input.observedC - (high ? Math.max(...elapsed) : Math.min(...elapsed)));
+  const bias = biases.length
+    ? Math.max(-INTRADAY_MAX_BIAS_C, Math.min(INTRADAY_MAX_BIAS_C, mean(biases)))
+    : 0;
+  // Hours still ahead (the current, partly elapsed hour is covered by the observation).
+  const remaining = today.filter((p) => hourOfLocal(p.time) >= Math.ceil(H - 1e-9)).map((p) => p.tempC + bias);
+  const remainingFcC = remaining.length ? (high ? Math.max(...remaining) : Math.min(...remaining)) : null;
+  const mu = membersC.length ? mean(membersC) : input.observedC;
+  const target = remainingFcC ?? input.observedC;
+  const centerC = f * mu + (1 - f) * target;
+  const shrink = Math.sqrt(f);
+  const samplesC = membersC.map((m) => centerC + (m - mu) * shrink);
+  const sigmaC = Math.max(INTRADAY_MIN_SIGMA_C, bandwidthC * shrink);
+  return { kind: input.kind, observedC: input.observedC, samplesC, sigmaC, remainingFrac: f, localHour: H, remainingFcC, biasC: bias, centerC };
+}
+
+/**
+ * P(final ∈ [lo, hi)) under an intraday model, in the event unit, as a mixture weighted by f
+ * (the fraction of the warming/cooling window still ahead):
+ *  - weight 1 − f, "remaining hours" view: final = max(obs, X) (min for lows). The chance that
+ *    X stays on the settled side of the observation lands in the observation's bucket.
+ *  - weight f, "conditioning" view: X | X ≥ obs (≤ for lows). Early in the day a member that is
+ *    already below the observation was simply too cold, so it is renormalized away rather than
+ *    piled onto the observed bucket.
+ * At f = 1 this equals the pre-intraday floor/renormalization; at f = 0 it is the pure
+ * remaining-hours model.
+ */
+export function intradayBucketProbability(model: IntradayModel, lo: number, hi: number, unit: TempUnit) {
+  if (!model.samplesC.length) return 0;
+  const k = unit === "F" ? 1.8 : 1;
+  const obs = convertTemp(model.observedC, unit);
+  const s = Math.max(model.sigmaC * k, 1e-6);
+  const obsIn = valueInBucket(obs, lo, hi);
+  const low = model.kind === "low";
+  const cdf = (x: number, c: number) => (x === Infinity ? 1 : x === -Infinity ? 0 : normCdf((x - c) / s));
+  let maxAcc = 0;
+  let piece = 0;
+  let open = 0;
+  for (const sc of model.samplesC) {
+    const c = convertTemp(sc, unit);
+    if (low) {
+      const top = Math.min(hi, obs);
+      const inside = top > lo ? Math.max(0, cdf(top, c) - cdf(lo, c)) : 0;
+      maxAcc += inside + (obsIn ? 1 - cdf(obs, c) : 0);
+      piece += inside;
+      open += cdf(obs, c);
+    } else {
+      const bottom = Math.max(lo, obs);
+      const inside = hi > bottom ? Math.max(0, cdf(hi, c) - cdf(bottom, c)) : 0;
+      maxAcc += inside + (obsIn ? cdf(obs, c) : 0);
+      piece += inside;
+      open += 1 - cdf(obs, c);
+    }
+  }
+  const n = model.samplesC.length;
+  const pMax = maxAcc / n;
+  // All samples far on the settled side: conditioning has nothing left, so the observation stands.
+  const pCond = open > 1e-9 ? piece / open : obsIn ? 1 : 0;
+  const f = model.remainingFrac;
+  return clamp01(f * pCond + (1 - f) * pMax);
+}
+
+/** Point estimates of the final extreme per member (°C): max/min(obs, sample). For the member-support test. */
+export function intradayFinalMembers(model: IntradayModel) {
+  return model.samplesC.map((x) => (model.kind === "low" ? Math.min(model.observedC, x) : Math.max(model.observedC, x)));
+}
+
+/** Median of a list (NaN when empty). */
+export function median(xs: number[]) {
+  if (!xs.length) return NaN;
+  const s = [...xs].sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}

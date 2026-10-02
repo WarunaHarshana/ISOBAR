@@ -721,6 +721,8 @@ export async function loadWeather(cities: CityMeta[], opts: LoadWeatherOpts = {}
       observedAt: metar?.reportTime ?? prev?.currentTime ?? null,
       observedMaxC,
       observedMinC,
+      latestObsC: metarC,
+      latestObsAt: metar && Number.isFinite(metarMs(metar)) ? new Date(metarMs(metar)).toISOString() : null,
       modelMeanC: members.length ? mean(members) : (prev?.dailyMax ?? null),
       modelStdC: members.length ? stdev(members) : null,
       modelMinC: members.length ? Math.min(...members) : null,

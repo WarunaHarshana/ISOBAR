@@ -2,6 +2,15 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { BotSettings, PaperFill, Side, Signal } from "./types";
 import { plausibilityVeto, type PlausibilityCtx } from "./plausibility";
+import { kellyFraction } from "./math";
+
+/** Latest YES-side quote of a market (Gamma), used to mark open tickets to market. */
+export type MarketMark = {
+  yesBid: number | null;
+  yesAsk: number | null;
+  yesMid: number | null;
+  at: string;
+};
 
 export type PaperBook = {
   settings: BotSettings;
@@ -10,6 +19,8 @@ export type PaperBook = {
   lastError: string | null;
   ticks: number;
   filledLastTick: number;
+  /** marketId → latest quote, refreshed each tick for markets with open tickets. Fills are never edited for marks. */
+  marks?: Record<string, MarketMark>;
 };
 
 export type PaperTradeOpts = {
@@ -35,6 +46,20 @@ export const PAPER_NO_MAX_YES = 0.8;
 /** YES only on the modal bucket and only when its modelP is at least this. */
 export const PAPER_YES_MIN_MODELP = 0.2;
 export const PAPER_MAX_PRICE = 0.85;
+/**
+ * Market-sanity guard: if the crowd prices one bucket of an event at ≥ this, the bot buys
+ * no YES on any other bucket of that event unless its model gives the favorite
+ * < PAPER_FAVORITE_GUARD_MODELP.
+ */
+export const PAPER_FAVORITE_GUARD = 0.85;
+/**
+ * Live-day deference: on the city's live local day, once the warming (cooling) window has
+ * started, YES only on the market's favorite bucket. The crowd sees higher-frequency
+ * observations than our 30–60 min METAR; the bot's live-day edge is sharpness on the same
+ * favorite, not picking a different bucket.
+ */
+export const PAPER_LIVE_DAY_DEFER = true;
+export const PAPER_FAVORITE_GUARD_MODELP = 0.5;
 export const PAPER_KELLY = 0.12;
 export const PAPER_MAX_POS = 0.08;
 export const PAPER_MAX_FILLS_PER_TICK = 4;
@@ -182,10 +207,30 @@ export function realizedPnl(fills: PaperFill[]) {
   return { closed, openCost };
 }
 
-/** Mark-to-model PnL: open = shares × modelP − cost; settled = payout − cost. */
-export function fillMarkPnl(fill: PaperFill): number {
-  if (fill.status === "open") return fill.shares * fill.modelP - fill.cost;
-  return fill.payout - fill.cost;
+const okPx = (x: number | null | undefined): x is number => x != null && Number.isFinite(x) && x > 0 && x < 1;
+
+/**
+ * Exit value per share of an open ticket at market: the best bid of the held side
+ * (YES bid; NO bid = 1 − YES ask), else the mid. Null when the market has no quote.
+ */
+export function markPrice(side: Side, mark: MarketMark | null | undefined): number | null {
+  if (!mark) return null;
+  if (side === "YES") {
+    if (okPx(mark.yesBid)) return mark.yesBid;
+    return mark.yesMid != null && Number.isFinite(mark.yesMid) ? mark.yesMid : null;
+  }
+  if (okPx(mark.yesAsk)) return 1 - mark.yesAsk;
+  return mark.yesMid != null && Number.isFinite(mark.yesMid) ? 1 - mark.yesMid : null;
+}
+
+/**
+ * Mark-to-market PnL: open = shares × market exit price − cost (0 when there is no
+ * quote yet: valued at cost, never at the model probability); settled = payout − cost.
+ */
+export function fillMarkPnl(fill: PaperFill, marks?: Record<string, MarketMark> | null): number {
+  if (fill.status !== "open") return fill.payout - fill.cost;
+  const px = markPrice(fill.side, marks?.[fill.marketId]);
+  return px == null ? 0 : fill.shares * px - fill.cost;
 }
 
 export type CityLedgerRow = {
@@ -202,8 +247,8 @@ export type CityLedgerRow = {
   markPnl: number;
 };
 
-/** Per-city paper ledger, ranked by closed PnL first, then mark-to-model. */
-export function cityLedger(fills: PaperFill[]): CityLedgerRow[] {
+/** Per-city paper ledger, ranked by closed PnL first, then mark-to-market. */
+export function cityLedger(fills: PaperFill[], marks?: Record<string, MarketMark> | null): CityLedgerRow[] {
   const byId = new Map<string, CityLedgerRow>();
   for (const f of fills) {
     const key = f.cityId || f.cityName || "unknown";
@@ -225,7 +270,7 @@ export function cityLedger(fills: PaperFill[]): CityLedgerRow[] {
       byId.set(key, row);
     }
     row.cost += f.cost;
-    row.markPnl += fillMarkPnl(f);
+    row.markPnl += fillMarkPnl(f, marks);
     if (f.side === "YES") row.yes += 1;
     else row.no += 1;
     if (f.status === "open") {
@@ -248,21 +293,32 @@ export type FillTicket = {
   status: PaperFill["status"];
   price: number;
   cost: number;
+  /** Open: exit price per share at market (held side's bid, else mid); null = no quote. Settled: 1 / 0. */
+  mark: number | null;
+  markSource: "bid" | "mid" | "none" | "settled";
   pnl: number;
 };
 
-/** Compact per-fill tickets for /health (mark-to-model PnL). */
-export function fillTickets(fills: PaperFill[]): FillTicket[] {
-  return fills.map((f) => ({
-    city: f.cityName,
-    side: f.side,
-    date: f.date,
-    question: f.question,
-    status: f.status,
-    price: f.price,
-    cost: f.cost,
-    pnl: fillMarkPnl(f),
-  }));
+/** Compact per-fill tickets for /health (mark-to-market PnL). */
+export function fillTickets(fills: PaperFill[], marks?: Record<string, MarketMark> | null): FillTicket[] {
+  return fills.map((f) => {
+    const m = marks?.[f.marketId];
+    const settled = f.status !== "open";
+    const mark = settled ? (f.status === "won" ? 1 : 0) : markPrice(f.side, m);
+    const fromBid = !settled && m != null && (f.side === "YES" ? okPx(m.yesBid) : okPx(m.yesAsk));
+    return {
+      city: f.cityName,
+      side: f.side,
+      date: f.date,
+      question: f.question,
+      status: f.status,
+      price: f.price,
+      cost: f.cost,
+      mark,
+      markSource: settled ? "settled" : mark == null ? "none" : fromBid ? "bid" : "mid",
+      pnl: fillMarkPnl(f, marks),
+    };
+  });
 }
 
 /** Cash available for new risk: bankroll + closed PnL − open cost. */
@@ -375,6 +431,8 @@ export function paperTrade(
 
   const minPx = signal.side === "YES" ? PAPER_MIN_PRICE_YES : PAPER_MIN_PRICE;
   if (price < minPx || price > PAPER_MAX_PRICE) return null;
+  // Edge must survive the actual fill price (a mid-priced signal can fill at a much worse ask).
+  if (signal.modelP - price < PAPER_MIN_EDGE) return null;
 
   // Predictioner gate — after fill price, before Kelly. Fail closed.
   const plausCtx: PlausibilityCtx = {};
@@ -395,7 +453,9 @@ export function paperTrade(
 
   const cash = availableCash(current);
   if (cash <= 0) return null;
-  const kellyFrac = signal.kelly * PAPER_KELLY;
+  // Kelly at the fill price (never larger than the signal's own Kelly).
+  const kelly = price > signal.marketP + 1e-9 ? Math.min(signal.kelly, kellyFraction(signal.modelP, price)) : signal.kelly;
+  const kellyFrac = kelly * PAPER_KELLY;
   const stake = Math.min(cash * Math.min(kellyFrac, PAPER_MAX_POS), cash * PAPER_MAX_POS);
   // Quant: if stake < $5, SKIP — do not round up.
   if (!(stake >= PAPER_MIN_STAKE)) return null;
