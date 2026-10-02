@@ -23,6 +23,11 @@ The desk UI polls `getPaperBookFn` on a short interval (see `usePaperBookQuery` 
 | `ISOBAR_PAPER_ARMED` | `true` re-arms the paper worker every tick (headless, 24/7). `false` (Railway default) leaves the book/UI Arm state alone. `ISOBAR_LIVE` / keys always win and disarm. |
 | `VITE_AUTH_ENABLED` | Keep `false` for the desk |
 | `ISOBAR_LIVE` / private keys | If set, worker **refuses to arm** |
+| `ISOBAR_PAPER_MIN_PRICE_YES` | YES floor (ask), default 0.12 (model-params.ts) |
+| `ISOBAR_TAKER_FEE_RATE` | Taker fee rate, default 0.05 (fee = rate·p·(1−p) per share) |
+| `ISOBAR_BLEND_AHEAD` / `ISOBAR_BLEND_SAMEDAY` | Model weight w for D-1+ / live-day knots `"hour:w,…"` (default 0 / `10:0,13:0.5,16:0.75`) |
+| `ISOBAR_BLEND_DISABLED` / `ISOBAR_STATION_BIAS_DISABLED` | `true` → raw model (w = 1) / no station correction |
+| `ISOBAR_LOG_DISABLED`, `ISOBAR_LOG_MAX_MB` (150), `ISOBAR_LOG_MIN_FREE_MB` (64), `ISOBAR_LOG_SNAPSHOT_MIN` (15) | Research log under `/data/logs` |
 
 ### WeatherNext 3 (primary forecast, optional)
 
@@ -155,7 +160,7 @@ priced from the time of day, not just floored by the observation:
 
 ## Caps (Quant freeze)
 
-- Min edge 6¢; NO 5–85¢; YES 3–85¢
+- Min edge 6¢ **net of the taker fee**; NO 5–85¢; YES 12–85¢ (`ISOBAR_PAPER_MIN_PRICE_YES`, was 3¢)
 - 0.12 Kelly, max 8% cash per fill
 - Max 4 fills/tick, 8 open, 1/event, **1/city-date**
 - Near-certainty gate: YES only on the modal bucket (highest modelP ≥ 20 %) with a raw ensemble member within one
@@ -171,7 +176,48 @@ priced from the time of day, not just floored by the observation:
   on the market's favorite bucket (the crowd has higher-frequency observations than our METAR; our live-day edge is
   sharpness on the same favorite). `PAPER_LIVE_DAY_DEFER`.
 - Open-ended tail buckets ("X or below / or higher"): YES only if the ensemble median is inside the bucket.
-- Fill price = worse of mid vs ask
+- Fill = walk of the real CLOB asks of the token bought (YES token / NO token) up to the limit price (highest
+  price with p − x − fee(x) ≥ 6¢, ≤ 85¢) for at most the Kelly target; price = VWAP; partial fills OK (≥ $5);
+  no book → no fill. Fill records carry `fee`, `requestedStake`, `bookLevels`, `depthLimited`, `limitPrice`.
 - Skip stake under $5 (no round-up)
 - Cash = bankroll + closed − openCost
 - Truncate fills log without dropping open rows
+
+## Backtest-fitted parameters (Oct 2026)
+
+`scripts/backtest/` (README there) replays the bot's own code — `assembleDeskSnapshot` + `paperTrade` of a given
+checkout — over 580 closed Polymarket temperature events (2026-09-18 … 10-01, 48 cities; 556 highs, 24 lows) with
+WeatherNext 3 inits pulled by the bot's `buildFetchSql` (30 jobs, 126.3 GiB billed), IEM METAR history and 5-min
+CLOB price history. Decision points D-1 18:00, D 09:00, 13:00, 16:00 local; latest init published ≥ 7 h earlier;
+METARs ≥ 10 min old; ask/bid = price ± p75 half-spread and ask depth = p25 of 248 live weather books (Oct 2), since
+historical books are not available. PnL is net of the taker fee.
+
+Model (bias-corrected, leave-one-date-out) vs market, multi-bucket Brier: D-1 18:00 0.745 vs 0.633, D 09:00 0.667
+vs 0.575, D 13:00 0.598 vs 0.457, D 16:00 0.225 vs 0.108 — **the market is better at every horizon** and the
+Brier/log-loss-optimal blend weight is 0 everywhere. WeatherNext is cold-biased (−0.46 °C mean, sd 1.0 °C at
+D 09:00) and the D-1 KDE is too wide (no bucket ever above ~35 %).
+
+- **Blend** `p = w·model + (1 − w)·mid` (mid = (bid + ask)/2): edges, Kelly and the NO model side use p; the raw
+  model still picks the modal bucket and the member-support tests. A bucket the observation already killed has p = 0.
+  w = 0 for D-1+ and before 10:00 local (those trades lost in every variant), rising to 0.5 at 13:00 and 0.75 from
+  16:00: the only profitable niche was live-day afternoon YES on the crowd favorite with the METAR-conditioned model
+  above it (~25 trades, ~80 % hit). This rises over the day rather than falling — the live-day model conditions on
+  observations, so its information arrives in the afternoon. Chosen on PnL from few trades: watch it.
+- **Station bias**: per station forecast − settled (bucket mid), James–Stein-shrunk toward 0
+  (`shrinkBiases`, τ² from the cross-section), highs only; members are shifted by −correction before pricing.
+  Largest: Taipei −1.8, Austin −1.5, Denver/Dallas −1.2, Karachi/São Paulo/Wellington ≈ −1.0 (forecast too cold);
+  Chongqing +0.9, Wuhan +0.8, Shenzhen +0.7 (too warm). Table + raw stats in `model-params.ts`.
+- **YES floor** 12¢: within 10–15¢ it did not change the final strategy's trades (default). Every YES under 20¢ in the
+  sims was a D-1 longshot (24 fills, 3 won).
+- **Fee**: Polymarket weather taker fee = shares × 0.05 × p × (1 − p) (docs.polymarket.com/trading/fees; Gamma
+  `feeSchedule {rate: 0.05, exponent: 1, takerOnly}`); edges are net of it and fills record it; PnL subtracts it.
+
+## Research log (`/data/logs`)
+
+Append-only JSONL, one file per UTC day (`isobar-YYYY-MM-DD.jsonl`), older days gzipped on the first write of a new
+day, oldest archives dropped above `ISOBAR_LOG_MAX_MB` (150 MB of the 500 MB volume; today's file is never dropped),
+no writes with < 64 MB free. Records: `wn_init` (per city per fetched init: grid cell, hourly p10/p50/p90 °C by
+lead hour, daily-max and daily-min members by local date), `market` (every 15 min: per event the buckets' YES
+price / bid / ask / raw model / blend, w, observation, source) and `fill` (fill + signal + bucket quote + top 10
+asks + intraday state). Expected ≈ 3 MB/day raw, < 1 MB/day gzipped. Future backtests (and refreshing the station
+bias from live data: wn_init daily max vs the settled bucket from the last market record) need no BigQuery.

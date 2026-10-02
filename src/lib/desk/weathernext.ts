@@ -62,6 +62,7 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { CityMeta, HourPoint } from "./types";
+import { appendLog, wnInitRecords } from "./forecast-log";
 
 export const WEATHERNEXT_LABEL = "WeatherNext 3";
 export const WEATHERNEXT_MEMBERS = 50;
@@ -869,6 +870,8 @@ async function fetchCities(
       const res = await run(sql, cfg);
       recordUsage(cfg, now, billed(res, est));
       const got = parseFetchRows(res.rows, batch);
+      // Research log (append-only JSONL under /data/logs): quantiles + members per city for this init.
+      appendLog(wnInitRecords(res.rows, batch, got, toNum));
       for (const [id, v] of got) parsed.set(id, v);
       for (const c of batch) if (!got.has(c.id)) empty.add(c.id);
       onBatch?.(got, batch);

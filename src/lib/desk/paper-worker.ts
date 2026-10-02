@@ -1,4 +1,6 @@
-import { fetchJson } from "./cache";
+import { cached, fetchJson } from "./cache";
+import { appendLog, marketRecord, snapshotDue } from "./forecast-log";
+import type { BookLevel } from "./strategy";
 import { buildDeskSnapshot, observedForSignal, pricingModel } from "./snapshot";
 import { CITIES } from "./cities";
 import type { PaperFill } from "./types";
@@ -124,6 +126,28 @@ export async function refreshOpenFillsFromGamma(
   return { fills: next, marks };
 }
 
+type ClobBook = { asks?: { price: string | number; size: string | number }[] };
+
+/** Ask ladder of one CLOB token (best first); null when the book can't be read (→ no fill). */
+export async function fetchAsks(tokenId: string | null | undefined): Promise<BookLevel[] | null> {
+  if (!tokenId) return null;
+  try {
+    const book = await cached(`clob:book:${tokenId}`, 5_000, () =>
+      fetchJson<ClobBook>(`https://clob.polymarket.com/book?token_id=${encodeURIComponent(tokenId)}`, {
+        headers: { "user-agent": "Mozilla/5.0 (compatible; IsobarDesk/1.0)" },
+      }),
+    );
+    const asks = (book?.asks ?? [])
+      .map((l) => ({ price: Number(l.price), size: Number(l.size) }))
+      .filter((l) => Number.isFinite(l.price) && Number.isFinite(l.size) && l.size > 0 && l.price > 0 && l.price < 1)
+      .sort((a, b) => a.price - b.price);
+    return asks.length ? asks : null;
+  } catch (err) {
+    console.warn("[isobar] CLOB book unavailable for", tokenId.slice(0, 12), err instanceof Error ? err.message : err);
+    return null;
+  }
+}
+
 export function getWorkerStatus() {
   const book = loadPaperBook({ refresh: true });
   return {
@@ -157,6 +181,8 @@ export async function tickPaperWorker(): Promise<PaperBook> {
     }
 
     const snapshot = await buildDeskSnapshot();
+    // Research log: market snapshot at decision time (throttled, append-only JSONL).
+    if (snapshotDue()) appendLog([marketRecord(snapshot)]);
 
     const refreshed = await refreshOpenFillsFromGamma(book.fills);
     // Keep the last known quote of a market whose Gamma read failed this tick.
@@ -176,7 +202,11 @@ export async function tickPaperWorker(): Promise<PaperBook> {
         const tz = CITIES.find((c) => c.id === sig.cityId)?.tz;
         const pm = pricingModel(wx, sig, tz);
         const draft = { ...book, fills: nextFills };
+        // Size to the real book: walk the asks of the token being bought (fail closed without a book).
+        const asks = await fetchAsks(sig.side === "YES" ? bucket?.clobYes : bucket?.clobNo);
+        if (!asks) continue;
         const fill = paperTrade(sig, draft, {
+          asks,
           bestBid: bucket?.bestBid ?? null,
           bestAsk: bucket?.bestAsk ?? null,
           members: pm.supportMembers,
@@ -189,13 +219,26 @@ export async function tickPaperWorker(): Promise<PaperBook> {
         if (!fill) continue;
         const intra = snapshot.events.find((e) => e.eventId === sig.eventId)?.intraday;
         console.log(
-          `[isobar] paper fill ${sig.side} "${sig.question}" @${fill.price.toFixed(3)} stake $${fill.cost.toFixed(0)} ` +
-            `modelP ${sig.modelP.toFixed(3)} edge ${(sig.modelP - fill.price).toFixed(3)} ` +
+          `[isobar] paper fill ${sig.side} "${sig.question}" @${fill.price.toFixed(3)} (VWAP, ${fill.bookLevels ?? 1} lvl, limit ${fill.limitPrice?.toFixed(3) ?? "-"}) ` +
+            `stake $${fill.cost.toFixed(0)}${fill.depthLimited ? ` of $${fill.requestedStake?.toFixed(0)} (depth-limited)` : ""} fee $${(fill.fee ?? 0).toFixed(2)} ` +
+            `p ${sig.modelP.toFixed(3)} (model ${sig.rawModelP?.toFixed(3) ?? "-"}, mid ${sig.marketMid?.toFixed(3) ?? "-"}, w ${sig.blendW?.toFixed(2) ?? "-"}) ` +
+            `net edge ${(sig.modelP - fill.price - (fill.fee ?? 0) / fill.shares).toFixed(3)} ` +
             (intra
               ? `live-day h${intra.localHour.toFixed(1)} obs ${intra.observedC} remFc ${intra.remainingFcC?.toFixed(1) ?? "-"} ` +
                 `bias ${intra.biasC.toFixed(1)} f ${intra.remainingFrac.toFixed(2)} center ${intra.centerC.toFixed(1)}`
               : "ensemble (not live day)"),
         );
+        appendLog([
+          {
+            t: "fill",
+            fill,
+            signal: sig,
+            bucket: bucket ? { label: bucket.label, yes: bucket.yesPrice, bid: bucket.bestBid, ask: bucket.bestAsk, modelP: bucket.modelP, blendP: bucket.blendP, w: bucket.blendW } : null,
+            asks: asks.slice(0, 10),
+            intraday: intra ?? null,
+            source: wx?.source ?? null,
+          },
+        ]);
         nextFills.unshift(fill);
         filled += 1;
         if (filled >= PAPER_MAX_FILLS_PER_TICK) break;

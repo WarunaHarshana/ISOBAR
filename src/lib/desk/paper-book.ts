@@ -3,6 +3,8 @@ import { dirname, join } from "node:path";
 import type { BotSettings, PaperFill, Side, Signal } from "./types";
 import { plausibilityVeto, type PlausibilityCtx } from "./plausibility";
 import { kellyFraction } from "./math";
+import { MODEL_PARAMS } from "./model-params";
+import { limitPrice, strategy, takerFee, walkAsks, type BookLevel } from "./strategy";
 
 /** Latest YES-side quote of a market (Gamma), used to mark open tickets to market. */
 export type MarketMark = {
@@ -27,6 +29,12 @@ export type PaperTradeOpts = {
   bestBid?: number | null;
   bestAsk?: number | null;
   fillPrice?: number | null;
+  /**
+   * Ask ladder of the side being bought (YES token asks for YES, NO token asks for NO).
+   * When given, the fill walks it up to the limit price (highest price still clearing the
+   * edge floor net of fee) for at most the Kelly target stake; price = VWAP, partial fills OK.
+   */
+  asks?: BookLevel[] | null;
   /** Predictioner ctx — optional ensemble / obs / clock. */
   members?: number[];
   observedC?: number | null;
@@ -39,8 +47,12 @@ export type PaperTradeOpts = {
 /** Quant freeze — keep worker + UI floors identical. */
 export const PAPER_MIN_EDGE = 0.06;
 export const PAPER_MIN_PRICE = 0.05;
-/** Member-supported (modal-bucket) YES may print cheaper than NO. */
-export const PAPER_MIN_PRICE_YES = 0.03;
+/**
+ * Default YES floor (executable ask) for a modal-bucket YES; live value = strategy().minPriceYes
+ * (env ISOBAR_PAPER_MIN_PRICE_YES). Was 3¢ before the WeatherNext backtest (see PAPER.md).
+ */
+export const PAPER_MIN_PRICE_YES = MODEL_PARAMS.minPriceYes;
+export const paperMinPriceYes = () => strategy().minPriceYes;
 /** Skip NO when the crowd already has YES ≥ this (cheap shorts of 80%+ favorites). */
 export const PAPER_NO_MAX_YES = 0.8;
 /** YES only on the modal bucket and only when its modelP is at least this. */
@@ -197,12 +209,15 @@ export function savePaperBook(next: PaperBook) {
   setCachedBook(next);
 }
 
+/** Taker fee paid on a fill (fills before fee accounting: 0). */
+export const fillFee = (f: PaperFill) => (Number.isFinite(f.fee) ? (f.fee as number) : 0);
+
 export function realizedPnl(fills: PaperFill[]) {
   let closed = 0;
   let openCost = 0;
   for (const f of fills) {
-    if (f.status === "open") openCost += f.cost;
-    else closed += f.payout - f.cost;
+    if (f.status === "open") openCost += f.cost + fillFee(f);
+    else closed += f.payout - f.cost - fillFee(f);
   }
   return { closed, openCost };
 }
@@ -228,9 +243,10 @@ export function markPrice(side: Side, mark: MarketMark | null | undefined): numb
  * quote yet: valued at cost, never at the model probability); settled = payout − cost.
  */
 export function fillMarkPnl(fill: PaperFill, marks?: Record<string, MarketMark> | null): number {
-  if (fill.status !== "open") return fill.payout - fill.cost;
+  if (fill.status !== "open") return fill.payout - fill.cost - fillFee(fill);
   const px = markPrice(fill.side, marks?.[fill.marketId]);
-  return px == null ? 0 : fill.shares * px - fill.cost;
+  // No quote: valued at cost (less the fee already paid).
+  return px == null ? 0 - fillFee(fill) || 0 : fill.shares * px - fill.cost - fillFee(fill);
 }
 
 export type CityLedgerRow = {
@@ -279,7 +295,7 @@ export function cityLedger(fills: PaperFill[], marks?: Record<string, MarketMark
     } else {
       if (f.status === "won") row.won += 1;
       else row.lost += 1;
-      row.closedPnl += f.payout - f.cost;
+      row.closedPnl += f.payout - f.cost - fillFee(f);
     }
   }
   return [...byId.values()].sort((a, b) => b.closedPnl - a.closedPnl || b.markPnl - a.markPnl);
@@ -418,6 +434,8 @@ export function paperTrade(
   }
 
   if (signal.edge < PAPER_MIN_EDGE) return null;
+  const strat = strategy();
+  const fee = (p: number) => takerFee(p, strat.takerFeeRate);
 
   let price: number;
   if (typeof opts === "number" || opts == null) {
@@ -429,10 +447,17 @@ export function paperTrade(
     price = conservativeFillPrice(signal.side, signal.marketP, opts.bestBid, opts.bestAsk);
   }
 
-  const minPx = signal.side === "YES" ? PAPER_MIN_PRICE_YES : PAPER_MIN_PRICE;
+  const asks = typeof opts === "object" && opts != null && Array.isArray(opts.asks) ? opts.asks : null;
+  if (asks) {
+    // Real book: best ask of the side bought is the first price (never better than the signal's).
+    const best = asks.filter((l) => l.size > 0 && l.price > 0 && l.price < 1).reduce((a, l) => Math.min(a, l.price), Infinity);
+    if (!Number.isFinite(best)) return null;
+    price = Math.max(price, best);
+  }
+  const minPx = signal.side === "YES" ? strat.minPriceYes : PAPER_MIN_PRICE;
   if (price < minPx || price > PAPER_MAX_PRICE) return null;
-  // Edge must survive the actual fill price (a mid-priced signal can fill at a much worse ask).
-  if (signal.modelP - price < PAPER_MIN_EDGE) return null;
+  // Edge must survive the actual fill price (a mid-priced signal can fill at a much worse ask), net of fee.
+  if (signal.modelP - price - fee(price) < PAPER_MIN_EDGE) return null;
 
   // Predictioner gate — after fill price, before Kelly. Fail closed.
   const plausCtx: PlausibilityCtx = {};
@@ -453,13 +478,25 @@ export function paperTrade(
 
   const cash = availableCash(current);
   if (cash <= 0) return null;
-  // Kelly at the fill price (never larger than the signal's own Kelly).
-  const kelly = price > signal.marketP + 1e-9 ? Math.min(signal.kelly, kellyFraction(signal.modelP, price)) : signal.kelly;
+  // Kelly at the fill price incl. fee (never larger than the signal's own Kelly).
+  const kelly = price > signal.marketP + 1e-9 ? Math.min(signal.kelly, kellyFraction(signal.modelP, price + fee(price))) : signal.kelly;
   const kellyFrac = kelly * PAPER_KELLY;
-  const stake = Math.min(cash * Math.min(kellyFrac, PAPER_MAX_POS), cash * PAPER_MAX_POS);
+  const target = Math.min(cash * Math.min(kellyFrac, PAPER_MAX_POS), cash * PAPER_MAX_POS);
   // Quant: if stake < $5, SKIP — do not round up.
-  if (!(stake >= PAPER_MIN_STAKE)) return null;
-  const shares = stake / price;
+  if (!(target >= PAPER_MIN_STAKE)) return null;
+  let stake = target;
+  let shares = stake / price;
+  let depth: Pick<PaperFill, "requestedStake" | "bookLevels" | "depthLimited" | "limitPrice"> = {};
+  if (asks) {
+    // Walk the asks up to the limit price for at most the Kelly target; VWAP fill, partial OK.
+    const limit = limitPrice(signal.modelP, PAPER_MIN_EDGE, PAPER_MAX_PRICE, strat.takerFeeRate);
+    const walk = walkAsks(asks, target, limit);
+    if (!walk.vwap || !(walk.cost >= PAPER_MIN_STAKE)) return null;
+    price = walk.vwap;
+    stake = walk.cost;
+    shares = walk.shares;
+    depth = { requestedStake: target, bookLevels: walk.levels, depthLimited: walk.partial, limitPrice: limit };
+  }
   return {
     id: `${signal.marketId}-${signal.side}-${Date.now()}`,
     eventId: signal.eventId,
@@ -476,6 +513,11 @@ export function paperTrade(
     placedAt: new Date().toISOString(),
     status: "open",
     payout: 0,
+    fee: Math.round(shares * fee(price) * 1e5) / 1e5,
+    ...depth,
+    ...(signal.rawModelP != null ? { rawModelP: signal.rawModelP } : {}),
+    ...(signal.marketMid !== undefined ? { marketMid: signal.marketMid } : {}),
+    ...(signal.blendW != null ? { blendW: signal.blendW } : {}),
   };
 }
 

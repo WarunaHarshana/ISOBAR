@@ -1,5 +1,6 @@
 import { getWorkerStatus, startPaperWorker } from "../../src/lib/desk/paper-worker";
 import { availableCash, cityLedger, fillTickets, loadPaperBook, realizedPnl } from "../../src/lib/desk/paper-book";
+import { strategy } from "../../src/lib/desk/strategy";
 
 /**
  * Railway healthcheck. Plain default export — Nitro v3 in this stack does not
@@ -26,6 +27,16 @@ export default function healthHandler() {
     fills: book.fills.length,
     cash: availableCash(book),
     pnl: realizedPnl(book.fills),
+    strategy: (() => {
+      const s = strategy();
+      return {
+        minPriceYes: s.minPriceYes,
+        takerFeeRate: s.takerFeeRate,
+        blend: s.blend,
+        stationBiasCities: Object.keys(s.stationBiasC).length,
+        fills: "walk CLOB asks to the net-edge limit, Kelly target cap, VWAP",
+      };
+    })(),
     marks: "market (held side's best bid, else mid; settled = resolution)",
     markPnl: fillTickets(book.fills, book.marks).reduce((a, t) => a + (t.status === "open" ? t.pnl : 0), 0),
     cities: cityLedger(book.fills, book.marks),
