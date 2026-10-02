@@ -75,6 +75,8 @@ export type WeatherNow = {
   membersByDate: Record<string, number[]>;
   /** Daily-MIN members by local date (low markets; only cities with live low markets). */
   membersMinByDate: Record<string, number[]>;
+  /** Provider label of membersMinByDate (WeatherNext / Open-Meteo ensemble / multi-model); null if none. */
+  minSource?: string | null;
   localDate: string;
   hourly: HourPoint[];
   source: string;
@@ -100,7 +102,21 @@ export type DeskEvent = {
   /** Ensemble mean of the event's kind (daily max for high, daily min for low), event unit. */
   modelHigh: number | null;
   observed: number | null;
+  /**
+   * Stats of the daily-MIN members actually used to price a LOW event (°C).
+   * Null for high events (the UI keeps the city's daily-max stats for those).
+   */
+  lowEnsemble?: EnsembleStats | null;
   bestSignal: Signal | null;
+};
+
+/** Ensemble summary for display, °C. */
+export type EnsembleStats = {
+  members: number;
+  stdC: number | null;
+  minC: number | null;
+  maxC: number | null;
+  source: string | null;
 };
 
 export type Signal = {

@@ -496,7 +496,25 @@ function Board({
           ) : null}
         </div>
 
-        {weather?.modelStdC != null ? (
+        {event.kind === "low" ? (
+          event.lowEnsemble ? (
+            <p className="relative mt-3 font-mono text-[11px] tabular text-white/40">
+              {event.lowEnsemble.members > 0 ? (
+                <>
+                  Ensemble {event.lowEnsemble.members} daily-min members
+                  {event.lowEnsemble.stdC != null ? ` · σ ${event.lowEnsemble.stdC.toFixed(2)}°C` : ""}
+                  {event.lowEnsemble.minC != null && event.lowEnsemble.maxC != null
+                    ? ` · range ${event.lowEnsemble.minC.toFixed(1)}–${event.lowEnsemble.maxC.toFixed(1)}°C`
+                    : ""}
+                  {event.lowEnsemble.source ? ` · ${event.lowEnsemble.source}` : ""}
+                </>
+              ) : (
+                <>Daily-min ensemble unavailable for {event.eventDate}</>
+              )}
+              {weather?.observedAt ? ` · obs ${fmtTime(weather.observedAt)}` : ""}
+            </p>
+          ) : null
+        ) : weather?.modelStdC != null ? (
           <p className="relative mt-3 font-mono text-[11px] tabular text-white/40">
             Ensemble {weather.membersC.length} members · σ {weather.modelStdC.toFixed(2)}°C
             {weather.modelMinC != null && weather.modelMaxC != null

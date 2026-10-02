@@ -9,7 +9,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { _resetCache } from "./cache.ts";
-import { bucketMid, bucketProbability, membersNearBucket, valueInBucket } from "./math.ts";
+import { bucketMid, bucketProbability, membersNearBucket, stdev, valueInBucket } from "./math.ts";
 import {
   PAPER_MAX_OPEN_PER_CITY_DATE,
   _resetPaperBookCache,
@@ -211,6 +211,42 @@ describe("snapshot: low markets are priced from daily-MIN members", () => {
   });
 });
 
+describe("snapshot: low-market stats line uses the daily-MIN members", () => {
+  it("low event exposes count/σ/range/source of the min members it was priced from, not the max", () => {
+    const minM = spread(31, 10, 0.2); // 7.0 … 13.0 °C
+    const w = wx({
+      // City-level stats are the daily-MAX ensemble (what the high line shows).
+      membersC: spread(50, 25),
+      modelStdC: 9.99,
+      modelMinC: 20,
+      modelMaxC: 30,
+      membersByDate: { [FUTURE]: spread(50, 25) },
+      membersMinByDate: { [FUTURE]: minM },
+      minSource: "Open-Meteo ensemble",
+    });
+    const snap = assembleDeskSnapshot({
+      events: [event("low", ladder({ 10: 0.2 })), event("high", ladder({ 25: 0.2 }), { eventId: "ev-high2" })],
+      weather: { nyc: w },
+    });
+    const low = snap.events.find((e) => e.kind === "low")!;
+    const high = snap.events.find((e) => e.kind === "high")!;
+    assert.ok(low.lowEnsemble);
+    assert.equal(low.lowEnsemble.members, 31);
+    assert.ok(Math.abs(low.lowEnsemble.minC! - 7) < 1e-9);
+    assert.ok(Math.abs(low.lowEnsemble.maxC! - 13) < 1e-9);
+    assert.ok(Math.abs(low.lowEnsemble.stdC! - stdev(minM)) < 1e-9);
+    assert.notEqual(low.lowEnsemble.stdC, w.modelStdC);
+    assert.equal(low.lowEnsemble.source, "Open-Meteo ensemble");
+    assert.equal(high.lowEnsemble ?? null, null, "high markets keep the daily-max stats");
+  });
+
+  it("low event without min members for its date reports 0 members (never the max figures)", () => {
+    const w = wx({ membersC: spread(50, 25), modelStdC: 1, membersByDate: { [FUTURE]: spread(50, 25) }, minSource: "Open-Meteo ensemble" });
+    const snap = assembleDeskSnapshot({ events: [event("low", ladder({}))], weather: { nyc: w } });
+    assert.deepEqual(snap.events[0].lowEnsemble, { members: 0, stdC: null, minC: null, maxC: null, source: null });
+  });
+});
+
 describe("snapshot: live-day low without an observed min", () => {
   it("is priced for display but never tradeable (the low may already be set)", () => {
     const w = wx({ localDate: TODAY, observedMinC: null, membersMinByDate: { [TODAY]: spread(30, 10) } });
@@ -400,6 +436,7 @@ describe("Open-Meteo: min only for live low cities, multi-model only as last res
     assert.equal(ens().length, 1);
     assert.match(ens()[0], /daily=temperature_2m_max&/);
     assert.deepEqual(wx.nyc.membersMinByDate, {});
+    assert.equal(wx.nyc.minSource, null);
     assert.equal(mm().length, 0);
   });
 
@@ -408,6 +445,7 @@ describe("Open-Meteo: min only for live low cities, multi-model only as last res
     const wx = await loadWeather([nyc], { lowDates });
     assert.equal(ens().filter((u) => u.includes("temperature_2m_min")).length, 1);
     assert.ok(Object.values(wx.nyc.membersMinByDate).some((m) => m.length >= 8));
+    assert.equal(wx.nyc.minSource, "Open-Meteo ensemble");
     await loadWeather([nyc], { lowDates });
     assert.equal(ens().length, 2, "second tick served from the per-city cache");
   });
@@ -423,6 +461,7 @@ describe("Open-Meteo: min only for live low cities, multi-model only as last res
     assert.match(wx.nyc.source, /Open-Meteo multi-model/);
     assert.ok(Object.values(wx.nyc.membersByDate).some((m) => m.length === 8));
     assert.ok(Object.values(wx.nyc.membersMinByDate).some((m) => m.length === 8));
+    assert.equal(wx.nyc.minSource, "Open-Meteo multi-model");
     await loadWeather([nyc], { lowDates });
     assert.equal(ens().length, 1, "still cooling down");
     assert.equal(mm().length, 1, "multi-model cached per city (30 min)");

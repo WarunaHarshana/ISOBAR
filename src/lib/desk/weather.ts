@@ -696,6 +696,13 @@ export async function loadWeather(cities: CityMeta[], opts: LoadWeatherOpts = {}
     // Quant: never ens.members / dates[0] fallback.
     const members = membersByDate[localDate] ?? [];
     const wnInit = wnCity?.init ?? (minProvider === "wn" ? wn.byCity.get(city.id)?.init : undefined);
+    const wnMinInit = minProvider === "wn" ? wn.byCity.get(city.id)?.init : undefined;
+    const minSource =
+      minProvider === "wn"
+        ? wnMinInit
+          ? weatherNextSourceLabel(wnMinInit)
+          : "WeatherNext"
+        : minProvider; // ENSEMBLE_ENDPOINT / MULTIMODEL_ENDPOINT labels, or null
     const sources = [
       wnInit ? weatherNextSourceLabel(wnInit) : null,
       maxProvider === ENSEMBLE_ENDPOINT || minProvider === ENSEMBLE_ENDPOINT ? "Open-Meteo ensemble" : null,
@@ -721,6 +728,7 @@ export async function loadWeather(cities: CityMeta[], opts: LoadWeatherOpts = {}
       membersC: members,
       membersByDate,
       membersMinByDate,
+      minSource,
       localDate,
       hourly,
       source: sources.join(" · ") || "unavailable",
