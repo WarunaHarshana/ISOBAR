@@ -178,9 +178,11 @@ describe("snapshot: low markets are priced from daily-MIN members", () => {
   });
 
   it("low event uses min members (not max), produces modelP, tradeable buckets and a modal YES", () => {
-    // Observed min 11.2 °C so far (the forecast low of ~10 °C is still ahead).
-    const w = wx({ localDate: TODAY, observedMinC: 11.2, membersByDate: { [TODAY]: spread(30, 25) }, membersMinByDate: { [TODAY]: spread(30, 10) } });
-    const snap = assembleDeskSnapshot({ events: [event("low", ladder({ 10: 0.2 }), { eventDate: TODAY })], weather: { nyc: w } });
+    // Observed min 12.4 °C so far (the forecast low of ~10 °C is still ahead).
+    const w = wx({ localDate: TODAY, observedMinC: 12.4, membersByDate: { [TODAY]: spread(30, 25) }, membersMinByDate: { [TODAY]: spread(30, 10) } });
+    // 00:30 NYC local: almost the whole cooling window is still ahead.
+    const now = new Date(`${TODAY}T04:30:00Z`);
+    const snap = assembleDeskSnapshot({ events: [event("low", ladder({ 10: 0.2 }), { eventDate: TODAY })], weather: { nyc: w }, now });
     const ev = snap.events[0];
     const b10 = ev.buckets.find((b) => b.label === "b10")!;
     const b18 = ev.buckets.find((b) => b.label === "b18")!;
@@ -351,23 +353,30 @@ describe("paper book: ledger, tickets, YES floor", () => {
     ...over,
   });
 
-  it("cityLedger ranks by closed PnL then mark-to-model; tickets carry mark PnL", () => {
+  it("cityLedger ranks by closed PnL then mark-to-market; tickets carry mark PnL", () => {
     const fills = [
       fill({ cityId: "nyc", status: "won", payout: 25 }), // +15 closed
-      fill({ cityId: "nyc", side: "NO", status: "open" }), // mark 25*0.6-10 = +5
+      fill({ cityId: "nyc", side: "NO", status: "open", marketId: "mn" }), // NO bid = 1 - YES ask 0.4 → 25*0.6-10 = +5
       fill({ cityId: "lon", cityName: "London", status: "lost", payout: 0 }), // -10 closed
-      fill({ cityId: "tok", cityName: "Tokyo", status: "open", modelP: 0.8 }), // mark +10
+      fill({ cityId: "tok", cityName: "Tokyo", status: "open", modelP: 0.99, marketId: "mt" }), // YES bid 0.8 → +10 (model ignored)
     ];
-    const rows = cityLedger(fills);
+    const at = "2099-01-01T00:00:00Z";
+    const marks = { mn: { yesBid: 0.3, yesAsk: 0.4, yesMid: 0.35, at }, mt: { yesBid: 0.8, yesAsk: 0.9, yesMid: 0.85, at } };
+    const rows = cityLedger(fills, marks);
     assert.deepEqual(rows.map((r) => r.cityId), ["nyc", "tok", "lon"]);
     assert.deepEqual(
       { yes: rows[0].yes, no: rows[0].no, open: rows[0].open, won: rows[0].won, closed: rows[0].closedPnl, mark: rows[0].markPnl },
       { yes: 1, no: 1, open: 1, won: 1, closed: 15, mark: 20 },
     );
     assert.equal(rows[2].lost, 1);
-    const t = fillTickets(fills);
+    const t = fillTickets(fills, marks);
     assert.equal(t.length, 4);
-    assert.equal(t[1].pnl, fillMarkPnl(fills[1]));
+    assert.equal(t[1].pnl, fillMarkPnl(fills[1], marks));
+    assert.equal(t[1].markSource, "bid");
+    assert.equal(t[0].markSource, "settled");
+    // No quote yet → valued at cost, never at the model probability.
+    assert.equal(fillMarkPnl(fills[3]), 0);
+    assert.equal(fillTickets(fills)[3].markSource, "none");
     assert.equal(t[0].city, "New York City");
   });
 

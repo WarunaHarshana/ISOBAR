@@ -26,7 +26,9 @@ export default function healthHandler() {
     fills: book.fills.length,
     cash: availableCash(book),
     pnl: realizedPnl(book.fills),
-    cities: cityLedger(book.fills),
-    tickets: fillTickets(book.fills),
+    marks: "market (held side's best bid, else mid; settled = resolution)",
+    markPnl: fillTickets(book.fills, book.marks).reduce((a, t) => a + (t.status === "open" ? t.pnl : 0), 0),
+    cities: cityLedger(book.fills, book.marks),
+    tickets: fillTickets(book.fills, book.marks),
   };
 }

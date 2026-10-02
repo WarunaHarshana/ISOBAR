@@ -179,7 +179,7 @@ export function DeskApp({ initial }: { initial: DeskSnapshot }) {
                   <span>Desk Activity Monitor</span>
                 </h2>
                 <p className="text-xs text-white/50 mt-0.5">
-                  Panoramic view: live market opportunities, mark-to-model exposure, and order book fills
+                  Panoramic view: live market opportunities, mark-to-market exposure, and order book fills
                 </p>
               </div>
               <Button

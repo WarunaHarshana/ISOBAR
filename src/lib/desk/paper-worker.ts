@@ -1,5 +1,5 @@
 import { fetchJson } from "./cache";
-import { buildDeskSnapshot, membersForEvent, observedForSignal } from "./snapshot";
+import { buildDeskSnapshot, observedForSignal, pricingModel } from "./snapshot";
 import { CITIES } from "./cities";
 import type { PaperFill } from "./types";
 import {
@@ -12,6 +12,7 @@ import {
   savePaperBook,
   settleFills,
   truncateFills,
+  type MarketMark,
   type PaperBook,
 } from "./paper-book";
 
@@ -45,6 +46,8 @@ function setRunning(next: boolean) {
 type GammaMarket = {
   id?: string;
   closed?: boolean;
+  bestBid?: number | string | null;
+  bestAsk?: number | string | null;
   outcomePrices?: string | string[];
   outcomes?: string | string[];
 };
@@ -67,8 +70,24 @@ function parseJsonArray(value: unknown): string[] {
  * Never settle from 98¢ prints (Quant hard rule).
  */
 export async function settleOpenFillsFromGamma(fills: PaperFill[]): Promise<PaperFill[]> {
+  return (await refreshOpenFillsFromGamma(fills)).fills;
+}
+
+const num = (v: unknown) => {
+  const n = typeof v === "number" ? v : typeof v === "string" && v.trim() ? Number(v) : NaN;
+  return Number.isFinite(n) ? n : null;
+};
+
+/**
+ * One Gamma read per open market: settle closed markets (winner only) and record the
+ * live YES quote (best bid / ask / mid) used to mark open tickets to market.
+ */
+export async function refreshOpenFillsFromGamma(
+  fills: PaperFill[],
+): Promise<{ fills: PaperFill[]; marks: Record<string, MarketMark> }> {
   const openIds = [...new Set(fills.filter((f) => f.status === "open").map((f) => f.marketId))];
-  if (!openIds.length) return fills;
+  const marks: Record<string, MarketMark> = {};
+  if (!openIds.length) return { fills, marks };
   let next = fills;
   for (const marketId of openIds) {
     try {
@@ -76,9 +95,20 @@ export async function settleOpenFillsFromGamma(fills: PaperFill[]): Promise<Pape
       const market = await fetchJson<GammaMarket>(url, {
         headers: { "user-agent": "Mozilla/5.0 (compatible; IsobarDesk/1.0)" },
       });
-      if (!market || market.closed !== true) continue;
+      if (!market) continue;
       const outcomes = parseJsonArray(market.outcomes);
       const prices = parseJsonArray(market.outcomePrices).map(Number);
+      if (market.closed !== true) {
+        const yesIdx0 = outcomes.findIndex((o) => o.toLowerCase() === "yes");
+        const mid = yesIdx0 >= 0 ? prices[yesIdx0] : prices[0];
+        marks[marketId] = {
+          yesBid: num(market.bestBid),
+          yesAsk: num(market.bestAsk),
+          yesMid: Number.isFinite(mid) ? mid : null,
+          at: new Date().toISOString(),
+        };
+        continue;
+      }
       let yesWon: boolean | null = null;
       const yesIdx = outcomes.findIndex((o) => o.toLowerCase() === "yes");
       const noIdx = outcomes.findIndex((o) => o.toLowerCase() === "no");
@@ -91,7 +121,7 @@ export async function settleOpenFillsFromGamma(fills: PaperFill[]): Promise<Pape
       console.warn("[isobar] gamma settle skipped for", marketId, err);
     }
   }
-  return next;
+  return { fills: next, marks };
 }
 
 export function getWorkerStatus() {
@@ -128,7 +158,9 @@ export async function tickPaperWorker(): Promise<PaperBook> {
 
     const snapshot = await buildDeskSnapshot();
 
-    book = { ...book, fills: await settleOpenFillsFromGamma(book.fills) };
+    const refreshed = await refreshOpenFillsFromGamma(book.fills);
+    // Keep the last known quote of a market whose Gamma read failed this tick.
+    book = { ...book, fills: refreshed.fills, marks: { ...(book.marks ?? {}), ...refreshed.marks } };
 
     let filled = 0;
     // Quant: skip new fills when snapshot.warning is set (missing weather / poly).
@@ -140,19 +172,30 @@ export async function tickPaperWorker(): Promise<PaperBook> {
         const bucket = snapshot.events.flatMap((e) => e.buckets).find((b) => b.marketId === sig.marketId);
         const wx = snapshot.weather[sig.cityId];
         // Quant: dated members by kind (max for high, min for low). Never membersC (wrong-day).
-        const members = membersForEvent(wx, sig.date, sig.kind);
+        // On the live day the support test uses the time-of-day conditioned final extremes.
+        const tz = CITIES.find((c) => c.id === sig.cityId)?.tz;
+        const pm = pricingModel(wx, sig, tz);
         const draft = { ...book, fills: nextFills };
         const fill = paperTrade(sig, draft, {
           bestBid: bucket?.bestBid ?? null,
           bestAsk: bucket?.bestAsk ?? null,
-          members,
+          members: pm.supportMembers,
           // Today's observed max (high) / min (low) only applies to today's (local) event.
           observedC: observedForSignal(wx, sig),
-          tz: CITIES.find((c) => c.id === sig.cityId)?.tz,
+          tz,
           lo: bucket?.lo,
           hi: bucket?.hi,
         });
         if (!fill) continue;
+        const intra = snapshot.events.find((e) => e.eventId === sig.eventId)?.intraday;
+        console.log(
+          `[isobar] paper fill ${sig.side} "${sig.question}" @${fill.price.toFixed(3)} stake $${fill.cost.toFixed(0)} ` +
+            `modelP ${sig.modelP.toFixed(3)} edge ${(sig.modelP - fill.price).toFixed(3)} ` +
+            (intra
+              ? `live-day h${intra.localHour.toFixed(1)} obs ${intra.observedC} remFc ${intra.remainingFcC?.toFixed(1) ?? "-"} ` +
+                `bias ${intra.biasC.toFixed(1)} f ${intra.remainingFrac.toFixed(2)} center ${intra.centerC.toFixed(1)}`
+              : "ensemble (not live day)"),
+        );
         nextFills.unshift(fill);
         filled += 1;
         if (filled >= PAPER_MAX_FILLS_PER_TICK) break;

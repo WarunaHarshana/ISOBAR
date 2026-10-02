@@ -5,6 +5,13 @@ import {
   bucketMid,
   bucketProbability,
   impliedTemp,
+  intradayBucketProbability,
+  intradayFinalMembers,
+  intradayModel,
+  kdeBandwidth,
+  localHourIn,
+  median,
+  type IntradayModel,
   kellyFraction,
   mean,
   membersNearBucket,
@@ -18,6 +25,9 @@ import {
   PAPER_MIN_EDGE,
   PAPER_MIN_PRICE,
   PAPER_MIN_PRICE_YES,
+  PAPER_FAVORITE_GUARD,
+  PAPER_FAVORITE_GUARD_MODELP,
+  PAPER_LIVE_DAY_DEFER,
   PAPER_NO_MAX_YES,
   PAPER_YES_MIN_MODELP,
 } from "./paper-book";
@@ -67,6 +77,60 @@ export function lowEnsembleStats(wx: WeatherNow | undefined, eventDate: string, 
   };
 }
 
+/** Live-day high without an observed max (no METAR at the settlement station): not traded from this local hour. */
+export const HIGH_BLIND_FROM_H = 12;
+
+export type PricingModel = {
+  /** Raw dated members (°C) of the event's kind. */
+  members: number[];
+  /** Live-day intraday model (observation + time of day); null off the live day or without an observation. */
+  intraday: IntradayModel | null;
+  /** Members used for the support test and the model mean: final-extreme point estimates when intraday, else raw. */
+  supportMembers: number[];
+};
+
+/**
+ * How an event is priced: off the live day from the raw ensemble; on the city's live
+ * local day with an observed extreme, from the intraday model (observed extreme +
+ * remaining-hours forecast, collapsing onto the observation after the daily peak).
+ */
+export function pricingModel(
+  wx: WeatherNow | undefined,
+  sig: { date: string; kind: TempKind },
+  tz: string | undefined,
+  now = new Date(),
+): PricingModel {
+  const members = membersForEvent(wx, sig.date, sig.kind);
+  const observedC = observedForSignal(wx, sig);
+  if (!wx || observedC == null || !ensembleOk(members)) return { members, intraday: null, supportMembers: members };
+  const bw = kdeBandwidth(members, "C", sig.date, tz, now);
+  const intraday = intradayModel(
+    members,
+    {
+      kind: sig.kind,
+      observedC,
+      latestObsC: wx.latestObsC ?? null,
+      latestObsAt: wx.latestObsAt ?? null,
+      hourly: wx.hourly,
+      localDate: wx.localDate,
+      tz,
+      now,
+    },
+    bw,
+  );
+  return { members, intraday, supportMembers: intradayFinalMembers(intraday) };
+}
+
+/** Executable buy price: YES at the ask, NO at 1 − YES bid (never better than the mid). */
+export function execPrice(side: "YES" | "NO", m: { yesPrice: number; noPrice: number; bestBid?: number | null; bestAsk?: number | null }) {
+  if (side === "YES") {
+    const ask = m.bestAsk;
+    return ask != null && Number.isFinite(ask) && ask > 0 ? Math.max(m.yesPrice, ask) : m.yesPrice;
+  }
+  const bid = m.bestBid;
+  return bid != null && Number.isFinite(bid) && bid > 0 ? Math.max(m.noPrice, 1 - bid) : m.noPrice;
+}
+
 function weatherHasDatedEnsemble(w: WeatherNow | undefined) {
   if (!w) return false;
   return (
@@ -109,8 +173,10 @@ export function assembleDeskSnapshot(opts: {
   events: ParsedEvent[];
   weather: Record<string, WeatherNow>;
   warning?: string | null;
+  now?: Date;
 }): DeskSnapshot {
   const { events, weather } = opts;
+  const now = opts.now ?? new Date();
   let warning = opts.warning ?? null;
   const sources = new Set<string>();
   for (const w of Object.values(weather)) {
@@ -133,9 +199,11 @@ export function assembleDeskSnapshot(opts: {
     const wx = weather[ev.city.id];
     const low = ev.kind === "low";
     // Daily-MAX members for highs, daily-MIN members for lows (never the other kind).
-    const members = membersForEvent(wx, ev.eventDate, ev.kind);
-    const enough = ensembleOk(members);
     const tz = ev.city.tz;
+    const pm = pricingModel(wx, { date: ev.eventDate, kind: ev.kind }, tz, now);
+    const members = pm.members;
+    const enough = ensembleOk(members);
+    const support = pm.supportMembers;
     const dayEnded = Boolean(wx?.localDate && wx.localDate > ev.eventDate);
     // Observed max (high) / observed min (low), only on the city's current local day.
     const observedC = observedForSignal(wx, { date: ev.eventDate, kind: ev.kind });
@@ -143,13 +211,20 @@ export function assembleDeskSnapshot(opts: {
     // A low is usually set by early morning: on its live day, without an observed min (no METAR
     // at the settlement station, e.g. HKO, or METAR down) it is priced for display but never traded.
     const lowBlind = low && wx?.localDate === ev.eventDate && observedC == null;
-    const mu = enough ? mean(members.map((m) => convertTemp(m, ev.unit))) : 0;
+    // Same for a live-day high from early afternoon: without an observed max the time-of-day
+    // conditioning can't run, and the raw daily-max ensemble ignores the hours already gone.
+    const highBlind = !low && wx?.localDate === ev.eventDate && observedC == null && localHourIn(tz, now) >= HIGH_BLIND_FROM_H;
+    const blind = lowBlind || highBlind;
+    const mu = enough ? mean(support.map((m) => convertTemp(m, ev.unit))) : 0;
+    const medU = enough ? convertTemp(median(support), ev.unit) : NaN;
     const gap = noGapMin(ev.unit);
-    const near = (lo: number, hi: number) => enough && membersNearBucket(members, lo, hi, ev.unit, ev.eventDate, tz);
+    const near = (lo: number, hi: number) => enough && membersNearBucket(support, lo, hi, ev.unit, ev.eventDate, tz, now);
     const buckets: MarketBucket[] = ev.markets.map((m) => {
-      const modelPRaw = enough
-        ? bucketProbability(members, m.bound.lo, m.bound.hi, ev.unit, ev.eventDate, observedC, tz, undefined, ev.kind)
-        : 0;
+      const modelPRaw = !enough
+        ? 0
+        : pm.intraday
+          ? intradayBucketProbability(pm.intraday, m.bound.lo, m.bound.hi, ev.unit)
+          : bucketProbability(members, m.bound.lo, m.bound.hi, ev.unit, ev.eventDate, observedC, tz, now, ev.kind);
       let modelP = modelPRaw;
       if (enough && obsU != null) {
         // Settled side of the observation: a high can't end below its max, a low can't end above its min.
@@ -164,14 +239,17 @@ export function assembleDeskSnapshot(opts: {
       const mid = bucketMid(m.bound.lo, m.bound.hi);
       const far = Math.abs(mid - mu) >= gap && (obsU == null || Math.abs(mid - obsU) >= gap);
       const noOk = enough && !supported && !obsIn && far && m.yesPrice < PAPER_NO_MAX_YES;
-      const edgeYes = enough && supported ? modelP - m.yesPrice : 0;
-      const edgeNo = noOk ? 1 - modelP - m.noPrice : 0;
-      const yesPxOk = m.yesPrice >= PAPER_MIN_PRICE_YES && m.yesPrice <= MAX_TRADE_PRICE && m.yesPrice < SETTLED_PRICE;
-      const noPxOk = m.noPrice >= MIN_TRADE_PRICE && m.noPrice <= MAX_TRADE_PRICE && m.noPrice < SETTLED_PRICE;
+      // Edges are against the executable price (YES ask / NO = 1 − YES bid), not the mid.
+      const yesExec = execPrice("YES", m);
+      const noExec = execPrice("NO", m);
+      const edgeYes = enough && supported ? modelP - yesExec : 0;
+      const edgeNo = noOk ? 1 - modelP - noExec : 0;
+      const yesPxOk = yesExec >= PAPER_MIN_PRICE_YES && yesExec <= MAX_TRADE_PRICE && m.yesPrice < SETTLED_PRICE;
+      const noPxOk = noExec >= MIN_TRADE_PRICE && noExec <= MAX_TRADE_PRICE && m.noPrice < SETTLED_PRICE;
       const tradeable =
         enough &&
         !dayEnded &&
-        !lowBlind &&
+        !blind &&
         m.noPrice < SETTLED_PRICE &&
         m.yesPrice < SETTLED_PRICE &&
         ((yesPxOk && edgeYes >= MIN_EDGE) || (noPxOk && edgeNo >= MIN_EDGE));
@@ -196,8 +274,8 @@ export function assembleDeskSnapshot(opts: {
         modelP,
         edgeYes,
         edgeNo,
-        kellyYes: enough && supported ? kellyFraction(modelP, m.yesPrice) : 0,
-        kellyNo: noOk ? kellyFraction(1 - modelP, m.noPrice) : 0,
+        kellyYes: enough && supported ? kellyFraction(modelP, yesExec) : 0,
+        kellyNo: noOk ? kellyFraction(1 - modelP, noExec) : 0,
         tradeable,
       };
     });
@@ -235,14 +313,42 @@ export function assembleDeskSnapshot(opts: {
       modelHigh,
       observed,
       lowEnsemble: lowEnsembleStats(wx, ev.eventDate, ev.kind),
+      intraday: pm.intraday
+        ? {
+            localHour: pm.intraday.localHour,
+            remainingFrac: pm.intraday.remainingFrac,
+            observedC: pm.intraday.observedC,
+            remainingFcC: pm.intraday.remainingFcC,
+            biasC: pm.intraday.biasC,
+            centerC: pm.intraday.centerC,
+            sigmaC: pm.intraday.sigmaC,
+          }
+        : null,
       bestSignal: null,
     };
 
-    if (enough && !warning && !dayEnded && !lowBlind) {
+    if (enough && !warning && !dayEnded && !blind) {
       // YES only on the modal bucket: highest modelP (≥ 20%) with member support.
       const modalYes = buckets
         .filter((b) => b.modelP >= PAPER_YES_MIN_MODELP && near(b.lo, b.hi))
         .sort((a, b) => b.modelP - a.modelP)[0];
+      // Market-sanity guard: when the crowd prices one bucket at ≥ 85%, no YES on any other bucket.
+      // Exceptions need independent support: on the live day only the observation itself (the
+      // observed extreme already sits in the bucket we buy, i.e. the market is stale); on other
+      // days a model that gives the favorite < 50%.
+      const fav = [...buckets].sort((a, b) => b.yesPrice - a.yesPrice)[0];
+      const liveDay = wx?.localDate === ev.eventDate;
+      const favGuard = (b: MarketBucket) => {
+        if (fav == null || fav.marketId === b.marketId || fav.yesPrice < PAPER_FAVORITE_GUARD) return false;
+        if (liveDay) return !(obsU != null && valueInBucket(obsU, b.lo, b.hi));
+        return fav.modelP >= PAPER_FAVORITE_GUARD_MODELP;
+      };
+      // Live-day deference (see PAPER_LIVE_DAY_DEFER): after the window starts, YES only on the crowd favorite.
+      const liveStarted = PAPER_LIVE_DAY_DEFER && pm.intraday != null && pm.intraday.remainingFrac < 1;
+      const deferOk = (b: MarketBucket) => !liveStarted || (fav != null && fav.marketId === b.marketId);
+      // Open-ended tail buckets aggregate many degrees, so "most mass" can be a tail: YES on one
+      // needs the ensemble median inside it.
+      const tailOk = (b: MarketBucket) => (Number.isFinite(b.lo) && Number.isFinite(b.hi)) || valueInBucket(medU, b.lo, b.hi);
       const lead = yesLeadMax(ev.unit);
       for (const b of buckets) {
         const spreadOk = b.spread == null || (Number.isFinite(b.spread) && b.spread <= MAX_SPREAD);
@@ -257,11 +363,14 @@ export function assembleDeskSnapshot(opts: {
           b.marketId === modalYes.marketId &&
           yesLeadOk &&
           b.edgeYes >= MIN_EDGE &&
-          b.yesPrice >= PAPER_MIN_PRICE_YES &&
-          b.yesPrice <= MAX_TRADE_PRICE &&
+          execPrice("YES", b) >= PAPER_MIN_PRICE_YES &&
+          execPrice("YES", b) <= MAX_TRADE_PRICE &&
           b.yesPrice < SETTLED_PRICE &&
           b.modelP >= PAPER_YES_MIN_MODELP &&
-          near(b.lo, b.hi)
+          near(b.lo, b.hi) &&
+          !favGuard(b) &&
+          deferOk(b) &&
+          tailOk(b)
         ) {
           candidates.push({
             eventId: event.eventId,
@@ -274,7 +383,7 @@ export function assembleDeskSnapshot(opts: {
             question: b.question,
             label: b.label,
             side: "YES",
-            marketP: b.yesPrice,
+            marketP: execPrice("YES", b),
             modelP: b.modelP,
             edge: b.edgeYes,
             kelly: b.kellyYes,
@@ -284,8 +393,8 @@ export function assembleDeskSnapshot(opts: {
         const noModel = 1 - b.modelP;
         if (
           b.edgeNo >= MIN_EDGE &&
-          b.noPrice >= MIN_TRADE_PRICE &&
-          b.noPrice <= MAX_TRADE_PRICE &&
+          execPrice("NO", b) >= MIN_TRADE_PRICE &&
+          execPrice("NO", b) <= MAX_TRADE_PRICE &&
           b.noPrice < SETTLED_PRICE &&
           noModel > 0.05 &&
           !near(b.lo, b.hi) &&
@@ -303,7 +412,7 @@ export function assembleDeskSnapshot(opts: {
             question: b.question,
             label: b.label,
             side: "NO",
-            marketP: b.noPrice,
+            marketP: execPrice("NO", b),
             modelP: noModel,
             edge: b.edgeNo,
             kelly: b.kellyNo,
@@ -333,7 +442,7 @@ export function assembleDeskSnapshot(opts: {
   }
 
   return {
-    fetchedAt: new Date().toISOString(),
+    fetchedAt: now.toISOString(),
     events: deskEvents,
     weather,
     signals: warning ? [] : signals.slice(0, 40),

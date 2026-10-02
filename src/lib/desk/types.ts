@@ -66,6 +66,9 @@ export type WeatherNow = {
   observedMaxC: number | null;
   /** Min METAR temp at the settlement station so far on the city's current local day. */
   observedMinC: number | null;
+  /** Latest METAR temp (°C) at the settlement station and its time (ISO); null without METAR. Never a forecast. */
+  latestObsC?: number | null;
+  latestObsAt?: string | null;
   modelMeanC: number | null;
   modelStdC: number | null;
   modelMinC: number | null;
@@ -107,6 +110,16 @@ export type DeskEvent = {
    * Null for high events (the UI keeps the city's daily-max stats for those).
    */
   lowEnsemble?: EnsembleStats | null;
+  /** Live-day time-of-day conditioning used to price this event (null off the live day / no observation). */
+  intraday?: {
+    localHour: number;
+    remainingFrac: number;
+    observedC: number;
+    remainingFcC: number | null;
+    biasC: number;
+    centerC: number;
+    sigmaC: number;
+  } | null;
   bestSignal: Signal | null;
 };
 

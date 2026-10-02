@@ -54,7 +54,7 @@ function bookPayload() {
     equity: book.settings.bankroll + pnl.closed,
     cash: availableCash(book),
     pnl,
-    cities: cityLedger(book.fills),
+    cities: cityLedger(book.fills, book.marks),
   };
 }
 

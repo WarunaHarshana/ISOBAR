@@ -118,11 +118,17 @@ Never attach Polymarket/CLOB secrets to this service. Do not wire this to poly5m
 
 ## Health
 
-`GET /health` → `{ ok, worker: { running, armed, lastTickAt, openFills, liveLocked, ticks, lastError, filledLastTick, cash }, openFills, fills, cash, pnl, cities, tickets }`
+`GET /health` → `{ ok, worker: { running, armed, lastTickAt, openFills, liveLocked, ticks, lastError, filledLastTick, cash }, openFills, fills, cash, pnl, marks, markPnl, cities, tickets }`
 
-- `cities`: per-city ledger (`cityLedger`) — YES/NO/open/won/lost counts, cost, closed PnL and mark-to-model PnL
-  (open fills marked at shares × modelP − cost), ranked by closed PnL then mark. Same field on the desk's paper API.
-- `tickets`: one row per fill (city, side, date, question, status, price, cost, mark PnL).
+- **Mark-to-market** (never the model probability): an open ticket is worth shares × the exit price of the held
+  side — the YES best bid for YES, 1 − YES best ask for NO, the mid when that side has no quote — minus cost. Quotes
+  come from the Gamma read of each open market every tick (`book.marks`, fills themselves are never edited); a ticket
+  with no quote yet is valued at cost (PnL 0). Settled tickets: payout − cost from the resolution.
+- `markPnl`: total mark-to-market PnL of open tickets.
+- `cities`: per-city ledger (`cityLedger`) — YES/NO/open/won/lost counts, cost, closed PnL and mark-to-market PnL,
+  ranked by closed PnL then mark. Same field on the desk's paper API (the desk ledger).
+- `tickets`: one row per fill (city, side, date, question, status, price, cost, `mark` exit price, `markSource`
+  bid / mid / none / settled, mark PnL).
 
 ## Settlement model
 
@@ -131,6 +137,21 @@ Never attach Polymarket/CLOB secrets to this service. Do not wire this to poly5m
 - Observed max = max METAR temperature at the settlement station since local midnight, at or before now (aviationweather `hours=` history). Forecast hours never count as observed, and it only conditions today's (local) HIGH markets.
 - Observed min mirrors it: min METAR temperature at the settlement station since local midnight, at or before now; it only conditions today's (local) LOW markets (members capped at the observed min, buckets wholly above it → 0).
 - "Lowest temperature" events are priced from **daily-MIN** members only (`membersMinByDate`, never the max members): WeatherNext daily min (comonotonic min of the hourly quantiles, a date only when all 24 local hours are covered) when it covers every live low date, else the Open-Meteo ensemble daily min. WeatherNext min members are computed from the same rows as the max (no extra BigQuery bytes); cache entries written before this change simply lack them until the next scheduled init. Same settlement rounding (bucket bounds) as highs. On its live local day a low market without an observed min (no METAR at the settlement station, e.g. HKO, or METAR unavailable) is priced for display but never traded — the low is usually already set by morning.
+
+## Live-day (intraday) model
+
+On the city's current local date, with an observed extreme at the settlement station, the daily max (min) is
+priced from the time of day, not just floored by the observation:
+
+- f = fraction of the warming window still ahead: 1 before 06:00 local, 0 two hours after the hourly forecast's own
+  peak (clamped 13–18 h; 17 h without an hourly forecast). Lows: 0 one hour after the forecast pre-noon trough (4–10 h).
+- Forecast bias = mean of (latest METAR − forecast for that hour, ≤ 3 h old) and (observed extreme − forecast
+  extreme over the elapsed hours), clamped ±4 °C. Target = bias-corrected max (min) of the hours still ahead.
+- Samples X_i = f·mean + (1−f)·target + (m_i − mean)·√f, Gaussian σ = max(0.5 °C, KDE bandwidth·√f).
+- P(bucket) = (1−f)·P(max(obs, X) ∈ bucket) + f·P(X ∈ bucket | X ≥ obs) (mirror for lows). Early in the day this
+  is the old floor/renormalization; after the peak the mass collapses onto the observed bucket with only the upside
+  the remaining hours' forecast supports. The member-support test uses the conditioned finals max(obs, X_i).
+- A live-day high without an observed max (no METAR, e.g. HKO) is not traded from 12:00 local (lows: all day).
 
 ## Caps (Quant freeze)
 
@@ -141,6 +162,15 @@ Never attach Polymarket/CLOB secrets to this service. Do not wire this to poly5m
   KDE bandwidth (KDE tail mass is not support). Live day: YES bucket at most 2.5 °C / 4.5 °F past the observed
   extreme. NO only if no member is near the bucket, the observation is not in it, its mid is ≥ 5 °C / 9 °F from the
   model mean and the observation, and crowd YES < 80¢. YES signals fill before NO. modelP is never mutated.
+- Edges are against the executable price: YES ask, NO = 1 − YES bid (never better than the mid). paperTrade
+  re-checks modelP − fill price ≥ 6¢ and re-sizes Kelly at the fill price.
+- Market-sanity guard: when one bucket of an event trades ≥ 85¢, no YES on any other bucket of that event. Exception
+  on the live day: the observed extreme already sits in the bucket bought (stale market). Other days: the model gives
+  the favorite < 50 %.
+- Live-day deference: on the city's live local day, once the warming (cooling) window has started (f < 1), YES only
+  on the market's favorite bucket (the crowd has higher-frequency observations than our METAR; our live-day edge is
+  sharpness on the same favorite). `PAPER_LIVE_DAY_DEFER`.
+- Open-ended tail buckets ("X or below / or higher"): YES only if the ensemble median is inside the bucket.
 - Fill price = worse of mid vs ask
 - Skip stake under $5 (no round-up)
 - Cash = bankroll + closed − openCost

@@ -18,7 +18,7 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "db:migrate": "node scripts/migrate.mjs",
-    "test": "node --test 'scripts/**/*.test.mjs' && node --experimental-strip-types --import ./scripts/ts-test-resolve.mjs --test src/lib/app-data/app-data.test.ts src/lib/auth/gate-identity.test.ts src/lib/desk/paper-book.test.ts src/lib/desk/plausibility.test.ts src/lib/desk/ensemble.test.ts src/lib/desk/snapshot-ensemble.test.ts src/lib/desk/weather.test.ts src/lib/desk/weathernext.test.ts src/lib/desk/settlement.test.ts src/lib/desk/openmeteo-cooldown.test.ts src/lib/desk/ported-logic.test.ts"
+    "test": "node --test 'scripts/**/*.test.mjs' && node --experimental-strip-types --import ./scripts/ts-test-resolve.mjs --test src/lib/app-data/app-data.test.ts src/lib/auth/gate-identity.test.ts src/lib/desk/paper-book.test.ts src/lib/desk/plausibility.test.ts src/lib/desk/ensemble.test.ts src/lib/desk/snapshot-ensemble.test.ts src/lib/desk/weather.test.ts src/lib/desk/weathernext.test.ts src/lib/desk/settlement.test.ts src/lib/desk/openmeteo-cooldown.test.ts src/lib/desk/ported-logic.test.ts src/lib/desk/intraday.test.ts"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.5.4",
