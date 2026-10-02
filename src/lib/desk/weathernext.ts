@@ -23,13 +23,23 @@
  * ~22 MiB per selected column per city per init regardless of how many
  * forecast hours we keep. We select 4 columns (hours, p10, p50, p90) → measured
  * ~196 MiB per city per init in production (~9 GiB for a full 47-city init).
- * We only fetch 00Z/12Z inits by default (2 × ~9 GiB ≈ 18 GiB/day, ≈ 540
- * GiB/month worst case, inside the 1 TiB/month free tier), probe for a new
- * init only after it is due, and enforce daily + monthly byte caps (default
- * 20 GiB/day, 600 GiB/month; persisted
- * to ISOBAR_DATA_DIR). When capped / unconfigured / failing we keep the last
- * good init (≤30 h old) or return nothing so weather.ts falls back to
- * Open-Meteo.
+ * We only fetch 00Z/12Z inits by default (2 × ~9.4 GiB ≈ 19 GiB/day, ≈ 580
+ * GiB/month), probe for a new init only after it is due, and enforce daily +
+ * monthly billed-byte caps (default 40 GiB/day, 1200 GiB/month; the counter is
+ * persisted to ISOBAR_DATA_DIR/weathernext-usage.json). When capped /
+ * unconfigured / failing we keep the last good init (≤30 h old) or return
+ * nothing so weather.ts falls back to Open-Meteo.
+ *
+ * Persistence (restarts / deploys never re-bill): the loaded init's per-city
+ * rows (members, hourly p50, grid cell) plus the init time and metadata are
+ * written atomically (tmp + rename) to ISOBAR_DATA_DIR/weathernext-cache.json
+ * after every change and loaded on startup when valid for the current
+ * dataset/table/maxHours. Only inits not already cached are fetched.
+ *
+ * Switching inits: a newer init is fetched only if the *full* pass for every
+ * city (EST_BYTES_PER_CITY × cities) fits the remaining daily AND monthly
+ * budget; otherwise the older cached init keeps serving. Only when there is
+ * no usable older init (none, or >30 h old) is a partial load allowed.
  *
  * Estimates vs bills: BigQuery's pre-run estimate ignores clustering, so it is
  * the whole init_time partition for every selected column (measured on the
@@ -49,7 +59,7 @@
  *     cross a cap. A pass that hits the cap mid-way keeps the cities already
  *     fetched (partial load) and fills the rest once budget frees up.
  */
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { CityMeta, HourPoint } from "./types";
 
@@ -92,6 +102,8 @@ export type WeatherNextConfig = {
   maxEstimateBytes: number;
   /** Where to persist the byte counter; null = in-memory only. */
   usageFile: string | null;
+  /** Where to persist the loaded init (per-city rows + metadata); null = in-memory only. */
+  cacheFile: string | null;
   credentials?: Record<string, unknown>;
 };
 
@@ -134,6 +146,10 @@ type WnState = {
   lastError: string | null;
   inflight: Promise<WeatherNextLoad> | null;
   usage: Usage | null;
+  /** Requested lat/lon per cached city (a moved city is refetched). */
+  coords: Map<string, [number, number]>;
+  /** Disk cache already read this process. */
+  cacheLoaded: boolean;
 };
 
 type WnGlobals = {
@@ -159,6 +175,8 @@ function state(): WnState {
       lastError: null,
       inflight: null,
       usage: null,
+      coords: new Map(),
+      cacheLoaded: false,
     };
   }
   return glob.__isobarWn;
@@ -218,10 +236,11 @@ export function weatherNextConfig(env: Record<string, string | undefined> = proc
     probeMs: num(env.ISOBAR_WEATHERNEXT_PROBE_MIN, 30, 10, 360) * 60_000,
     maxHours: Math.round(num(env.ISOBAR_WEATHERNEXT_MAX_HOURS, 120, 24, 360)),
     initHours: initHours.length ? [...new Set(initHours)].sort((a, b) => a - b) : [0, 12],
-    dailyCapBytes: num(env.ISOBAR_WEATHERNEXT_DAILY_GIB, 20, 0, 1024) * GIB,
-    monthlyCapBytes: num(env.ISOBAR_WEATHERNEXT_MONTHLY_GIB, 600, 0, 1024) * GIB,
+    dailyCapBytes: num(env.ISOBAR_WEATHERNEXT_DAILY_GIB, 40, 0, 10240) * GIB,
+    monthlyCapBytes: num(env.ISOBAR_WEATHERNEXT_MONTHLY_GIB, 1200, 0, 10240) * GIB,
     maxEstimateBytes: num(env.ISOBAR_WEATHERNEXT_MAX_ESTIMATE_GIB, 28, 0, 1024 * 1024) * GIB,
     usageFile: join(dataDir, "weathernext-usage.json"),
+    cacheFile: join(dataDir, "weathernext-cache.json"),
     ...(credentials ? { credentials } : {}),
   };
 }
@@ -497,7 +516,13 @@ function loadUsage(cfg: WeatherNextConfig, nowMs: number): Usage {
   const month = day.slice(0, 7);
   if (!st.usage && cfg.usageFile) {
     try {
-      st.usage = JSON.parse(readFileSync(cfg.usageFile, "utf8")) as Usage;
+      const raw = JSON.parse(readFileSync(cfg.usageFile, "utf8")) as Partial<Usage>;
+      const ok =
+        typeof raw?.day === "string" &&
+        typeof raw.month === "string" &&
+        Number.isFinite(raw.dayBytes) &&
+        Number.isFinite(raw.monthBytes);
+      st.usage = ok ? (raw as Usage) : null;
     } catch {
       st.usage = null;
     }
@@ -515,11 +540,24 @@ function recordUsage(cfg: WeatherNextConfig, nowMs: number, bytes: number) {
   u.monthBytes += bytes;
   if (!cfg.usageFile) return;
   try {
-    mkdirSync(dirname(cfg.usageFile), { recursive: true });
-    writeFileSync(cfg.usageFile, JSON.stringify(u));
+    writeAtomic(cfg.usageFile, JSON.stringify(u));
   } catch (err) {
     console.warn("[isobar] WeatherNext usage persist failed", err instanceof Error ? err.message : err);
   }
+}
+
+/** Write via tmp file + rename so a crash mid-write never leaves a torn file. */
+function writeAtomic(file: string, text: string) {
+  mkdirSync(dirname(file), { recursive: true });
+  const tmp = `${file}.tmp-${process.pid}`;
+  writeFileSync(tmp, text);
+  renameSync(tmp, file);
+}
+
+/** Remaining bytes under both caps (the tighter one). */
+function remainingBudget(cfg: WeatherNextConfig, nowMs: number) {
+  const u = loadUsage(cfg, nowMs);
+  return Math.min(cfg.dailyCapBytes - u.dayBytes, cfg.monthlyCapBytes - u.monthBytes);
 }
 
 function withinBudget(cfg: WeatherNextConfig, nowMs: number, estBytes: number) {
@@ -538,6 +576,146 @@ function billed(res: WeatherNextResult, est: number) {
 
 export function weatherNextUsage(): Usage | null {
   return state().usage ? { ...state().usage! } : null;
+}
+
+/* ------------------------------------------------------------------ cache */
+
+export const WEATHERNEXT_CACHE_VERSION = 1;
+
+export type WeatherNextCacheFile = {
+  version: number;
+  savedAt: string;
+  /** Init the desk is on (newest fully/partially fetched). */
+  init: string;
+  datasetProject: string;
+  dataset: string;
+  table: string;
+  maxHours: number;
+  /** Per city: rows (members + hourly p50 + grid cell) and the requested lat/lon. Entries may be from an older init (fallback). */
+  cities: Record<string, WeatherNextCity & { reqLat: number; reqLon: number }>;
+  /** City ids queried for `init` that returned no grid cell. */
+  empty: string[];
+};
+
+function validCity(v: unknown): v is WeatherNextCity & { reqLat: number; reqLon: number } {
+  if (!v || typeof v !== "object") return false;
+  const c = v as Record<string, unknown>;
+  return (
+    typeof c.init === "string" &&
+    Number.isFinite(Date.parse(c.init)) &&
+    Number.isFinite(c.reqLat) &&
+    Number.isFinite(c.reqLon) &&
+    !!c.membersByDate &&
+    typeof c.membersByDate === "object" &&
+    Object.values(c.membersByDate as Record<string, unknown>).every((m) => Array.isArray(m) && m.every(Number.isFinite)) &&
+    Array.isArray(c.hourly)
+  );
+}
+
+/** Load the persisted init once per process (startup). Invalid / mismatched files are ignored. */
+function loadCache(cfg: WeatherNextConfig) {
+  const st = state();
+  if (st.cacheLoaded) return;
+  st.cacheLoaded = true;
+  if (!cfg.cacheFile || st.init) return;
+  let raw: WeatherNextCacheFile;
+  try {
+    raw = JSON.parse(readFileSync(cfg.cacheFile, "utf8")) as WeatherNextCacheFile;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+      console.warn("[isobar] WeatherNext cache unreadable, ignoring:", err instanceof Error ? err.message : err);
+    } else {
+      console.log("[isobar] WeatherNext cache: none yet at", cfg.cacheFile);
+    }
+    return;
+  }
+  const why =
+    raw?.version !== WEATHERNEXT_CACHE_VERSION
+      ? "version"
+      : raw.datasetProject !== cfg.datasetProject || raw.dataset !== cfg.dataset || raw.table !== cfg.table
+        ? "table"
+        : raw.maxHours !== cfg.maxHours
+          ? "maxHours"
+          : typeof raw.init !== "string" || !Number.isFinite(Date.parse(raw.init))
+            ? "init"
+            : !raw.cities || typeof raw.cities !== "object"
+              ? "cities"
+              : null;
+  if (why) {
+    console.warn(`[isobar] WeatherNext cache ignored (${why} mismatch/invalid):`, cfg.cacheFile);
+    return;
+  }
+  const init = new Date(raw.init).toISOString();
+  for (const [id, c] of Object.entries(raw.cities)) {
+    if (!validCity(c)) continue;
+    const { reqLat, reqLon, ...city } = c;
+    st.cities.set(id, city);
+    st.coords.set(id, [reqLat, reqLon]);
+  }
+  st.empty = new Set(Array.isArray(raw.empty) ? raw.empty.filter((x): x is string => typeof x === "string") : []);
+  st.init = init;
+  const onInit = [...st.cities.values()].filter((c) => c.init === init).length;
+  console.log(
+    `[isobar] WeatherNext init ${init} loaded from cache for ${onInit} cities` +
+      (st.cities.size > onInit ? ` (+${st.cities.size - onInit} older-init fallback)` : "") +
+      ` (saved ${raw.savedAt}; no BigQuery job)`,
+  );
+}
+
+function saveCache(cfg: WeatherNextConfig) {
+  const st = state();
+  if (!cfg.cacheFile || !st.init) return;
+  const cities: WeatherNextCacheFile["cities"] = {};
+  for (const [id, c] of st.cities) {
+    const ll = st.coords.get(id);
+    if (!ll) continue;
+    cities[id] = { ...c, reqLat: ll[0], reqLon: ll[1] };
+  }
+  const body: WeatherNextCacheFile = {
+    version: WEATHERNEXT_CACHE_VERSION,
+    savedAt: new Date().toISOString(),
+    init: st.init,
+    datasetProject: cfg.datasetProject,
+    dataset: cfg.dataset,
+    table: cfg.table,
+    maxHours: cfg.maxHours,
+    cities,
+    empty: [...st.empty],
+  };
+  try {
+    writeAtomic(cfg.cacheFile, JSON.stringify(body));
+  } catch (err) {
+    console.warn("[isobar] WeatherNext cache persist failed", err instanceof Error ? err.message : err);
+  }
+}
+
+/** Drop cached cities whose requested coordinates changed (e.g. cities.ts edit). */
+function dropMovedCities(cities: CityMeta[]) {
+  const st = state();
+  let dropped = 0;
+  for (const c of cities) {
+    const ll = st.coords.get(c.id);
+    if (ll && (ll[0] !== c.lat || ll[1] !== c.lon)) {
+      st.cities.delete(c.id);
+      st.empty.delete(c.id);
+      st.coords.delete(c.id);
+      dropped++;
+    }
+  }
+  return dropped;
+}
+
+function freshCity(c: WeatherNextCity | undefined, now: number) {
+  return !!c && now - Date.parse(c.init) <= STALE_INIT_MS;
+}
+
+/** Cities on the current init that are still fresh (a usable older init to fall back on). */
+function usableCurrentInit(now: number) {
+  const st = state();
+  if (!st.init || now - Date.parse(st.init) > STALE_INIT_MS) return 0;
+  let n = 0;
+  for (const c of st.cities.values()) if (c.init === st.init) n++;
+  return n;
 }
 
 /* ------------------------------------------------------------------- load */
@@ -563,12 +741,11 @@ function activeConfig(): WeatherNextConfig | null {
 
 function pick(cities: CityMeta[], err: string | null): WeatherNextLoad {
   const st = state();
+  const now = Date.now();
   const byCity = new Map<string, WeatherNextCity>();
-  if (st.init && Date.now() - Date.parse(st.init) <= STALE_INIT_MS) {
-    for (const c of cities) {
-      const hit = st.cities.get(c.id);
-      if (hit) byCity.set(c.id, hit);
-    }
+  for (const c of cities) {
+    const hit = st.cities.get(c.id);
+    if (freshCity(hit, now)) byCity.set(c.id, hit!);
   }
   return { configured: true, init: byCity.size ? st.init : null, byCity, error: err };
 }
@@ -632,6 +809,7 @@ async function fetchCities(
   cities: CityMeta[],
   init: string,
   now: number,
+  onBatch?: (got: Map<string, WeatherNextCity>, batch: CityMeta[]) => void,
 ): Promise<FetchOutcome> {
   const parsed = new Map<string, WeatherNextCity>();
   const empty = new Set<string>();
@@ -658,6 +836,7 @@ async function fetchCities(
       const got = parseFetchRows(res.rows, batch);
       for (const [id, v] of got) parsed.set(id, v);
       for (const c of batch) if (!got.has(c.id)) empty.add(c.id);
+      onBatch?.(got, batch);
     }
     return { parsed, empty, error: null };
   } catch (error) {
@@ -677,14 +856,40 @@ function fail(cities: CityMeta[], now: number, err: unknown): WeatherNextLoad {
   return pick(cities, budget && st.init ? null : st.lastError);
 }
 
+function adopt(cities: CityMeta[], got: Map<string, WeatherNextCity>, emptyIds: Iterable<string>) {
+  const st = state();
+  const byId = new Map(cities.map((c) => [c.id, c]));
+  for (const [id, v] of got) {
+    st.cities.set(id, v);
+    st.empty.delete(id);
+    const c = byId.get(id);
+    if (c) st.coords.set(id, [c.lat, c.lon]);
+  }
+  for (const id of emptyIds) {
+    st.empty.add(id);
+    const c = byId.get(id);
+    if (c) st.coords.set(id, [c.lat, c.lon]);
+  }
+}
+
 async function refresh(cfg: WeatherNextConfig, cities: CityMeta[]): Promise<WeatherNextLoad> {
   const st = state();
   const now = Date.now();
+  const first = !st.cacheLoaded;
+  loadCache(cfg);
+  const u = loadUsage(cfg, now); // persisted day/month counters (also rolls them over)
+  if (first) {
+    console.log(
+      `[isobar] WeatherNext caps ${fmtGiB(cfg.dailyCapBytes)} GiB/day, ${fmtGiB(cfg.monthlyCapBytes)} GiB/month; ` +
+        `billed so far ${fmtGiB(u.dayBytes)} GiB today (${u.day} UTC), ${fmtGiB(u.monthBytes)} GiB this month`,
+    );
+  }
+  if (dropMovedCities(cities)) saveCache(cfg);
   if (now < st.backoffUntil) return pick(cities, st.lastError);
   const run = g().__isobarWnRunner ?? defaultRunner;
 
   try {
-    // 1) Is a newer init due and not loaded yet? Free dry-run probe, at most every probeMs.
+    // 1) Is a newer init due and not loaded/cached yet? Free dry-run probe, at most every probeMs.
     const candidates = dueInitCandidates(now, cfg.initHours);
     const newestDue = candidates[0]?.toISOString() ?? null;
     const behind = !st.init || (newestDue != null && Date.parse(newestDue) > Date.parse(st.init));
@@ -692,21 +897,47 @@ async function refresh(cfg: WeatherNextConfig, cities: CityMeta[]): Promise<Weat
       st.lastProbeAt = now;
       const latest = await probeLatestInit(cfg, run, candidates, st.init);
       if (latest) {
-        // Gate on the first batch only: fetchCities checks every batch against
-        // both caps before starting it, and keeps a partial load if it stops.
-        if (!withinBudget(cfg, now, EST_BYTES_PER_CITY * Math.min(cities.length, FETCH_BATCH_SIZE))) {
-          console.warn("[isobar] WeatherNext budget: keeping previous init", st.init);
-          return pick(cities, st.init ? null : "WeatherNext byte budget reached");
+        const older = usableCurrentInit(now);
+        const fullPass = EST_BYTES_PER_CITY * cities.length;
+        const left = remainingBudget(cfg, now);
+        if (older > 0) {
+          // A usable older init exists: switch only if the whole pass fits both caps.
+          if (fullPass > left) {
+            console.warn(
+              `[isobar] WeatherNext budget: new init ${latest} needs ~${fmtGiB(fullPass)} GiB for ${cities.length} cities, ` +
+                `${fmtGiB(Math.max(0, left))} GiB left (day/month caps); keeping cached init ${st.init} (${older} cities)`,
+            );
+            return pick(cities, null);
+          }
+        } else if (!withinBudget(cfg, now, EST_BYTES_PER_CITY * Math.min(cities.length, FETCH_BATCH_SIZE))) {
+          // No usable older init: partial loads are allowed, gate on the first batch.
+          console.warn("[isobar] WeatherNext budget: cannot start init", latest, "and no usable cached init");
+          return pick(cities, "WeatherNext byte budget reached");
         }
-        const out = await fetchCities(cfg, run, cities, latest, now);
+        const prevInit = st.init;
+        const pendingEmpty: string[] = [];
+        const out = await fetchCities(cfg, run, cities, latest, now, (got, batch) => {
+          const emptyIds = batch.filter((c) => !got.has(c.id)).map((c) => c.id);
+          if (st.init !== latest) {
+            // Switch on the first batch with cells; older-init rows stay as per-city fallback.
+            if (!got.size) {
+              pendingEmpty.push(...emptyIds);
+              return;
+            }
+            st.init = latest;
+            st.empty = new Set();
+            adopt(cities, new Map(), pendingEmpty);
+          }
+          adopt(batch, got, emptyIds);
+          // Persist after every batch so bytes already billed survive a crash/restart.
+          saveCache(cfg);
+        });
         if (out.parsed.size) {
-          st.init = latest;
-          st.cities = out.parsed;
-          st.empty = out.empty;
           st.lastError = null;
           console.log(
-            `[isobar] WeatherNext init ${latest} loaded for ${out.parsed.size}/${cities.length} cities` +
-              ` (usage today ${Math.round((st.usage?.dayBytes ?? 0) / MIB)} MiB billed)`,
+            `[isobar] WeatherNext init ${latest} fetched for ${out.parsed.size}/${cities.length} cities` +
+              (prevInit ? ` (was ${prevInit})` : "") +
+              ` (usage today ${Math.round((st.usage?.dayBytes ?? 0) / MIB)} MiB billed, cached to ${cfg.cacheFile ?? "memory"})`,
           );
         }
         if (out.error) {
@@ -718,13 +949,14 @@ async function refresh(cfg: WeatherNextConfig, cities: CityMeta[]): Promise<Weat
       }
     }
 
-    // 2) Same init, new cities appeared (e.g. a new Polymarket event).
+    // 2) Same init, cities not yet on it (new Polymarket event, or a partial pass).
     if (st.init) {
-      const missing = cities.filter((c) => !st.cities.has(c.id) && !st.empty.has(c.id));
+      const missing = cities.filter((c) => st.cities.get(c.id)?.init !== st.init && !st.empty.has(c.id));
       if (missing.length && withinBudget(cfg, now, EST_BYTES_PER_CITY * Math.min(missing.length, FETCH_BATCH_SIZE))) {
-        const out = await fetchCities(cfg, run, missing, st.init, now);
-        for (const [id, v] of out.parsed) st.cities.set(id, v);
-        for (const id of out.empty) st.empty.add(id);
+        const out = await fetchCities(cfg, run, missing, st.init, now, (got, batch) => {
+          adopt(batch, got, batch.filter((c) => !got.has(c.id)).map((c) => c.id));
+          saveCache(cfg);
+        });
         if (out.error) return fail(cities, now, out.error);
       }
     }
