@@ -12,6 +12,7 @@ import {
   buildFetchSql,
   buildProbeSql,
   dailyMaxMembers,
+  dailyMinMembers,
   FETCH_BATCH_SIZE,
   probeLatestInit,
   dueInitCandidates,
@@ -729,5 +730,116 @@ describe("loadWeather with WeatherNext primary", () => {
     } finally {
       console.error = orig;
     }
+  });
+});
+
+describe("WeatherNext daily-min members (low markets)", () => {
+  const stubOm = (log: string[]) => {
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      log.push(url);
+      if (url.includes("ensemble-api.open-meteo.com")) {
+        const q = new URL(url).searchParams;
+        const tz = q.get("timezone") ?? "UTC";
+        const key = q.get("daily") ?? "temperature_2m_max";
+        const days = [0, 1, 2, 3].map((k) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(new Date(Date.now() + k * 86_400_000)));
+        const daily: Record<string, Array<number | string>> = { time: days, [key]: days.map(() => 10) };
+        for (let i = 1; i <= 50; i++) daily[`${key}_member${String(i).padStart(2, "0")}`] = days.map(() => 10 + i * 0.05);
+        return jsonResponse({ latitude: 0, longitude: 0, daily });
+      }
+      if (url.includes("previous-runs-api.open-meteo.com")) return jsonResponse({});
+      if (url.includes("aviationweather.gov")) return jsonResponse([]);
+      return jsonResponse({}, 404);
+    }) as typeof fetch;
+  };
+
+  it("daily min is the comonotonic min per member and needs all 24 local hours", () => {
+    const start = Date.parse("2026-07-10T04:00:00Z"); // 00:00 EDT
+    const hours: WnHour[] = [];
+    for (let h = 0; h < 24; h++) {
+      const mid = h === 5 ? 12 : 20; // trough at 05:00 local
+      hours.push({ validMs: start + h * 3600_000, q: [mid - 2, mid, mid + 2] });
+    }
+    const min = dailyMinMembers(hours, "America/New_York", 50);
+    const max = dailyMaxMembers(hours, "America/New_York", 50);
+    assert.deepEqual(Object.keys(min), ["2026-07-10"]);
+    assert.equal(min["2026-07-10"].length, 50);
+    for (let i = 0; i < 50; i++) assert.ok(min["2026-07-10"][i] <= max["2026-07-10"][i]);
+    assert.ok(Math.abs((min["2026-07-10"][24] + min["2026-07-10"][25]) / 2 - 12) < 0.05);
+    // Missing the pre-dawn hours → no min for that date (max still emitted: 11–23 covered).
+    const late = hours.slice(6);
+    assert.deepEqual(dailyMinMembers(late, "America/New_York"), {});
+    assert.deepEqual(Object.keys(dailyMaxMembers(late, "America/New_York")), ["2026-07-10"]);
+  });
+
+  it("parseFetchRows emits membersMinByDate alongside the max (same rows, no extra query)", () => {
+    const parsed = parseFetchRows(fakeRows(0, "2026-07-10T00:00:00.000Z"), [nyc]).get("nyc")!;
+    const dates = Object.keys(parsed.membersMinByDate ?? {});
+    assert.ok(dates.length >= 3);
+    for (const d of dates) {
+      assert.equal(parsed.membersMinByDate![d].length, 50);
+      assert.ok(Math.max(...parsed.membersMinByDate![d]) < Math.min(...parsed.membersByDate[d]));
+    }
+  });
+
+  it("an older cache file without membersMinByDate still loads from disk with zero BigQuery jobs", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wn-min-"));
+    const cacheFile = join(dir, "weathernext-cache.json");
+    try {
+      _setWeatherNextConfig({ ...cfg, cacheFile, usageFile: join(dir, "u.json"), dailyCapBytes: 40 * 1024 ** 3 });
+      runnerFor(defaultHandler());
+      const log = console.log;
+      console.log = () => {};
+      try {
+        await loadWeatherNext([nyc]);
+        const disk = JSON.parse(readFileSync(cacheFile, "utf8"));
+        assert.ok(disk.cities.nyc.membersMinByDate, "new fetches persist the min members");
+        delete disk.cities.nyc.membersMinByDate; // simulate the pre-port cache on /data
+        writeFileSync(cacheFile, JSON.stringify(disk));
+        _resetWeatherNext();
+        calls = [];
+        dryCalls = [];
+        const b = await loadWeatherNext([nyc]);
+        assert.equal(calls.length, 0, "no billed job just to backfill min members");
+        assert.equal(dryCalls.length, 0);
+        assert.ok(b.byCity.get("nyc"));
+        assert.equal(b.byCity.get("nyc")!.membersMinByDate, undefined);
+      } finally {
+        console.log = log;
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("loadWeather: WN min covers every live low date → no Open-Meteo request at all", async () => {
+    const log: string[] = [];
+    stubOm(log);
+    runnerFor(defaultHandler());
+    const first = await loadWeather([nyc]);
+    const tomorrow = Object.keys(first.nyc.membersByDate).sort()[1];
+    log.length = 0;
+    const wx = await loadWeather([nyc], { lowDates: { nyc: [tomorrow] } });
+    assert.equal(log.filter((u) => u.includes("ensemble-api")).length, 0);
+    assert.equal(wx.nyc.membersMinByDate[tomorrow].length, 50);
+    assert.match(wx.nyc.source, /^WeatherNext 3/);
+  });
+
+  it("loadWeather: WN min missing for a live low date → one Open-Meteo min request for that city only", async () => {
+    const log: string[] = [];
+    stubOm(log);
+    runnerFor(defaultHandler(latestInit(), [1])); // tokyo: no WN cells
+    const wx = await loadWeather([nyc, tokyo], { lowDates: { nyc: ["2000-01-01"] } });
+    const ens = log.filter((u) => u.includes("ensemble-api"));
+    const minReq = ens.filter((u) => u.includes("daily=temperature_2m_min"));
+    const maxReq = ens.filter((u) => u.includes("daily=temperature_2m_max"));
+    assert.equal(maxReq.length, 1, "max only for the WN-uncovered city");
+    assert.match(maxReq[0], /latitude=35\.6762&/);
+    assert.equal(minReq.length, 1);
+    assert.match(minReq[0], /latitude=40\.7829&/);
+    assert.ok(Object.values(wx.nyc.membersMinByDate).some((m) => m.length >= 50));
+    assert.deepEqual(wx.tokyo.membersMinByDate, {}, "no min members for a city without low markets");
+    // Max members still WeatherNext (one provider per city and kind).
+    assert.ok(Object.values(wx.nyc.membersByDate).every((m) => m.length === 50));
   });
 });

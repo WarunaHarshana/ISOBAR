@@ -20,7 +20,7 @@ The desk UI polls `getPaperBookFn` on a short interval (see `usePaperBookQuery` 
 | Var | Purpose |
 | --- | --- |
 | `ISOBAR_DATA_DIR` | Persistence dir. **Set to `/data` on Railway** (volume mount). Code default is `/data`. |
-| `ISOBAR_PAPER_ARMED` | Headless arm on empty book (`true`/`false`) |
+| `ISOBAR_PAPER_ARMED` | `true` re-arms the paper worker every tick (headless, 24/7). `false` (Railway default) leaves the book/UI Arm state alone. `ISOBAR_LIVE` / keys always win and disarm. |
 | `VITE_AUTH_ENABLED` | Keep `false` for the desk |
 | `ISOBAR_LIVE` / private keys | If set, worker **refuses to arm** |
 
@@ -99,6 +99,13 @@ blew the daily limit within hours, after which every request 429'd).
   Cached per city; a city is re-requested at most every `ensembleRefreshMs(n)` = max(30 min, interval keeping the
   ensemble under 6 000 weighted calls/day) → 30 min for a few cities, ~59 min for all 48. Last good members serve for
   up to 12 h.
+- **Ensemble daily min** (low markets): requested only for cities with a live "Lowest temperature" market whose
+  WeatherNext daily-min members do not cover every live low date. Separate `daily=temperature_2m_min` request
+  (5.1 calls/city), same per-city cache, same 429 cooldown as the max (sent after the max, never into a cooldown),
+  and counted in the same 6 000/day budget (`ensembleRefreshMs(maxCities + minCities)`).
+- **Multi-model** (tertiary, `api.open-meteo.com/v1/forecast`, 8 global deterministic models → 8 members): only for
+  cities with no WeatherNext and no Open-Meteo ensemble members, not even last good (ensemble cooling down / failing).
+  ~1–2 weighted calls/city, at most every 30 min per city, own 429 cooldown, last good kept 12 h.
 - **Forecast** (dashboard hourly/current, `previous-runs-api`): cached per city, refreshed every 30 min (~1 weighted
   call/city), last good kept 6 h.
 - **429 / 403**: the endpoint (ensemble or forecast, separately) goes on cooldown: Retry-After if sent (+≤10 % jitter),
@@ -111,20 +118,29 @@ Never attach Polymarket/CLOB secrets to this service. Do not wire this to poly5m
 
 ## Health
 
-`GET /health` → `{ ok, worker: { running, armed, lastTickAt, openFills, … }, openFills }`
+`GET /health` → `{ ok, worker: { running, armed, lastTickAt, openFills, liveLocked, ticks, lastError, filledLastTick, cash }, openFills, fills, cash, pnl, cities, tickets }`
+
+- `cities`: per-city ledger (`cityLedger`) — YES/NO/open/won/lost counts, cost, closed PnL and mark-to-model PnL
+  (open fills marked at shares × modelP − cost), ranked by closed PnL then mark. Same field on the desk's paper API.
+- `tickets`: one row per fill (city, side, date, question, status, price, cost, mark PnL).
 
 ## Settlement model
 
 - Forecast points and METAR observations use the **settlement station** from the market rules (`cities.ts`), e.g. NYC = LaGuardia (KLGA), London = London City (EGLC), Paris = Le Bourget (LFPB), Hong Kong = HK Observatory (no METAR).
 - NOAA/Weather Underground markets settle on whole degrees (nearest), so a bucket "72°F" is the true max in [71.5, 72.5). HKO markets ("one decimal place") truncate: "28°C" = [28.0, 29.0). The rule is read from each event description.
 - Observed max = max METAR temperature at the settlement station since local midnight, at or before now (aviationweather `hours=` history). Forecast hours never count as observed, and it only conditions today's (local) HIGH markets.
-- "Lowest temperature" events are shown but never priced (members are daily maxima).
+- Observed min mirrors it: min METAR temperature at the settlement station since local midnight, at or before now; it only conditions today's (local) LOW markets (members capped at the observed min, buckets wholly above it → 0).
+- "Lowest temperature" events are priced from **daily-MIN** members only (`membersMinByDate`, never the max members): WeatherNext daily min (comonotonic min of the hourly quantiles, a date only when all 24 local hours are covered) when it covers every live low date, else the Open-Meteo ensemble daily min. WeatherNext min members are computed from the same rows as the max (no extra BigQuery bytes); cache entries written before this change simply lack them until the next scheduled init. Same settlement rounding (bucket bounds) as highs. On its live local day a low market without an observed min (no METAR at the settlement station, e.g. HKO, or METAR unavailable) is priced for display but never traded — the low is usually already set by morning.
 
 ## Caps (Quant freeze)
 
-- Min edge 6¢, price 5–85¢
+- Min edge 6¢; NO 5–85¢; YES 3–85¢
 - 0.12 Kelly, max 8% cash per fill
-- Max 4 fills/tick, 8 open, 1/event, 2/city-date
+- Max 4 fills/tick, 8 open, 1/event, **1/city-date**
+- Near-certainty gate: YES only on the modal bucket (highest modelP ≥ 20 %) with a raw ensemble member within one
+  KDE bandwidth (KDE tail mass is not support). Live day: YES bucket at most 2.5 °C / 4.5 °F past the observed
+  extreme. NO only if no member is near the bucket, the observation is not in it, its mid is ≥ 5 °C / 9 °F from the
+  model mean and the observation, and crowd YES < 80¢. YES signals fill before NO. modelP is never mutated.
 - Fill price = worse of mid vs ask
 - Skip stake under $5 (no round-up)
 - Cash = bankroll + closed − openCost

@@ -64,12 +64,17 @@ export type WeatherNow = {
   station: string | null;
   observedAt: string | null;
   observedMaxC: number | null;
+  /** Min METAR temp at the settlement station so far on the city's current local day. */
+  observedMinC: number | null;
   modelMeanC: number | null;
   modelStdC: number | null;
   modelMinC: number | null;
   modelMaxC: number | null;
   membersC: number[];
+  /** Daily-MAX members by local date (high markets). */
   membersByDate: Record<string, number[]>;
+  /** Daily-MIN members by local date (low markets; only cities with live low markets). */
+  membersMinByDate: Record<string, number[]>;
   localDate: string;
   hourly: HourPoint[];
   source: string;
@@ -92,6 +97,7 @@ export type DeskEvent = {
   context: string | null;
   buckets: MarketBucket[];
   implied: number | null;
+  /** Ensemble mean of the event's kind (daily max for high, daily min for low), event unit. */
   modelHigh: number | null;
   observed: number | null;
   bestSignal: Signal | null;

@@ -369,11 +369,11 @@ describe("#5 Open-Meteo single-flight is per city set", () => {
 });
 
 describe("low-temperature events are not priced with daily-max members", () => {
-  it("kind=low → no tradeable buckets, no signals", () => {
+  it("kind=low with only daily-MAX members → no tradeable buckets, no signals", () => {
     const wx = {
       tempC: 20, humidity: null, windMs: null, weatherCode: null, cover: null, station: null, observedAt: null,
-      observedMaxC: null, modelMeanC: 20, modelStdC: 1, modelMinC: 18, modelMaxC: 22,
-      membersC: [], membersByDate: { "2099-01-02": Array.from({ length: 20 }, (_, i) => 18 + i * 0.2) },
+      observedMaxC: null, observedMinC: null, modelMeanC: 20, modelStdC: 1, modelMinC: 18, modelMaxC: 22,
+      membersC: [], membersByDate: { "2099-01-02": Array.from({ length: 20 }, (_, i) => 18 + i * 0.2) }, membersMinByDate: {},
       localDate: "2099-01-01", hourly: [], source: "test",
     } as WeatherNow;
     const ev: ParsedEvent = {

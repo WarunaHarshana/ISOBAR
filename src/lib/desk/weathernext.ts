@@ -123,6 +123,12 @@ export type WeatherNextCity = {
   gridLon: number;
   /** Per local date (city tz) → synthetic daily-max members, °C. */
   membersByDate: Record<string, number[]>;
+  /**
+   * Per local date → synthetic daily-min members, °C. Optional: cache entries
+   * written before lows were priced lack it (they are NOT refetched for it — the
+   * next scheduled init fills it in at no extra BigQuery cost).
+   */
+  membersMinByDate?: Record<string, number[]>;
   /** Hourly p50, ISO UTC times. */
   hourly: HourPoint[];
 };
@@ -382,13 +388,13 @@ function localParts(ms: number, tz: string): { date: string; hour: number } {
   return { date: `${parts.year}-${parts.month}-${parts.day}`, hour: Number(parts.hour) % 24 };
 }
 
-/**
- * Daily-max members per local date. A date is emitted only when the forecast
- * covers every local hour from REQUIRED_FIRST_LOCAL_HOUR through 23 (so the
- * afternoon peak is inside the window); earlier hours present are included.
- * Partially covered dates are dropped (fail closed → no trade that date).
- */
-export function dailyMaxMembers(hours: WnHour[], tz: string, n = WEATHERNEXT_MEMBERS): Record<string, number[]> {
+function dailyExtremeMembers(
+  hours: WnHour[],
+  tz: string,
+  n: number,
+  firstLocalHour: number,
+  pick: "max" | "min",
+): Record<string, number[]> {
   const byDate = new Map<string, { hours: Set<number>; rows: WnHour[] }>();
   for (const h of hours) {
     if (!h.q.every(Number.isFinite)) continue;
@@ -405,7 +411,7 @@ export function dailyMaxMembers(hours: WnHour[], tz: string, n = WEATHERNEXT_MEM
   const out: Record<string, number[]> = {};
   for (const [date, slot] of byDate) {
     let covered = true;
-    for (let hr = REQUIRED_FIRST_LOCAL_HOUR; hr <= 23; hr++) {
+    for (let hr = firstLocalHour; hr <= 23; hr++) {
       if (!slot.hours.has(hr)) {
         covered = false;
         break;
@@ -413,12 +419,36 @@ export function dailyMaxMembers(hours: WnHour[], tz: string, n = WEATHERNEXT_MEM
     }
     if (!covered) continue;
     out[date] = ranks.map((z) => {
-      let best = -Infinity;
-      for (const row of slot.rows) best = Math.max(best, quantileAtZ(row.q, z));
+      let best = pick === "max" ? -Infinity : Infinity;
+      for (const row of slot.rows) {
+        const v = quantileAtZ(row.q, z);
+        best = pick === "max" ? Math.max(best, v) : Math.min(best, v);
+      }
       return Math.round(best * 100) / 100;
     });
   }
   return out;
+}
+
+/**
+ * Daily-max members per local date. A date is emitted only when the forecast
+ * covers every local hour from REQUIRED_FIRST_LOCAL_HOUR through 23 (so the
+ * afternoon peak is inside the window); earlier hours present are included.
+ * Partially covered dates are dropped (fail closed → no trade that date).
+ */
+export function dailyMaxMembers(hours: WnHour[], tz: string, n = WEATHERNEXT_MEMBERS): Record<string, number[]> {
+  return dailyExtremeMembers(hours, tz, n, REQUIRED_FIRST_LOCAL_HOUR, "max");
+}
+
+/**
+ * Daily-min members per local date, same comonotonic construction as the max
+ * (member at normal score z = min over the day's hours of the z-quantile). The
+ * low can fall at any hour (pre-dawn, or late evening behind a front), so a
+ * date is emitted only when ALL local hours 00–23 are covered; partial dates
+ * are dropped (fail closed → Open-Meteo min fallback / no trade).
+ */
+export function dailyMinMembers(hours: WnHour[], tz: string, n = WEATHERNEXT_MEMBERS): Record<string, number[]> {
+  return dailyExtremeMembers(hours, tz, n, 0, "min");
 }
 
 /* ------------------------------------------------------------- row parsing */
@@ -465,6 +495,7 @@ export function parseFetchRows(rows: WeatherNextRow[], cities: CityMeta[]): Map<
       gridLat: slot.lat,
       gridLon: slot.lon,
       membersByDate: dailyMaxMembers(slot.hours, city.tz || "UTC"),
+      membersMinByDate: dailyMinMembers(slot.hours, city.tz || "UTC"),
       hourly: slot.hours
         .filter((h) => Number.isFinite(h.q[1]))
         .map((h) => ({ time: new Date(h.validMs).toISOString(), tempC: Math.round(h.q[1] * 10) / 10 })),
@@ -608,6 +639,10 @@ function validCity(v: unknown): v is WeatherNextCity & { reqLat: number; reqLon:
     !!c.membersByDate &&
     typeof c.membersByDate === "object" &&
     Object.values(c.membersByDate as Record<string, unknown>).every((m) => Array.isArray(m) && m.every(Number.isFinite)) &&
+    (c.membersMinByDate === undefined ||
+      (!!c.membersMinByDate &&
+        typeof c.membersMinByDate === "object" &&
+        Object.values(c.membersMinByDate as Record<string, unknown>).every((m) => Array.isArray(m) && m.every(Number.isFinite)))) &&
     Array.isArray(c.hourly)
   );
 }

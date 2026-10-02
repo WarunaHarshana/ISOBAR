@@ -1,5 +1,6 @@
 import { fetchJson } from "./cache";
-import { buildDeskSnapshot, observedForSignal } from "./snapshot";
+import { buildDeskSnapshot, membersForEvent, observedForSignal } from "./snapshot";
+import { CITIES } from "./cities";
 import type { PaperFill } from "./types";
 import {
   PAPER_MAX_FILLS_PER_TICK,
@@ -117,6 +118,12 @@ export async function tickPaperWorker(): Promise<PaperBook> {
     if (lock && book.settings.armed) {
       book = { ...book, settings: { ...book.settings, armed: false }, lastError: lock };
       savePaperBook(book);
+    } else if (!lock && !book.settings.armed && process.env.ISOBAR_PAPER_ARMED === "true") {
+      // Headless paper arm: re-arm each tick (24/7) when explicitly enabled. Paper only;
+      // liveTradingLocked() (ISOBAR_LIVE / keys present) always wins and disarms above.
+      book = { ...book, settings: { ...book.settings, armed: true } };
+      savePaperBook(book);
+      console.log("[isobar] paper worker armed from ISOBAR_PAPER_ARMED");
     }
 
     const snapshot = await buildDeskSnapshot();
@@ -132,15 +139,16 @@ export async function tickPaperWorker(): Promise<PaperBook> {
         if (sig.edge < PAPER_MIN_EDGE) continue;
         const bucket = snapshot.events.flatMap((e) => e.buckets).find((b) => b.marketId === sig.marketId);
         const wx = snapshot.weather[sig.cityId];
-        // Quant: members only from membersByDate[eventDate]. Never membersC (wrong-day).
-        const members = wx?.membersByDate?.[sig.date];
+        // Quant: dated members by kind (max for high, min for low). Never membersC (wrong-day).
+        const members = membersForEvent(wx, sig.date, sig.kind);
         const draft = { ...book, fills: nextFills };
         const fill = paperTrade(sig, draft, {
           bestBid: bucket?.bestBid ?? null,
           bestAsk: bucket?.bestAsk ?? null,
           members,
-          // Today's observed max only applies to today's (local) event, never to future dates.
+          // Today's observed max (high) / min (low) only applies to today's (local) event.
           observedC: observedForSignal(wx, sig),
+          tz: CITIES.find((c) => c.id === sig.cityId)?.tz,
           lo: bucket?.lo,
           hi: bucket?.hi,
         });
