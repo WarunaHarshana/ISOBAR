@@ -8,6 +8,7 @@ import {
   kellyFraction,
   mean,
   membersNearBucket,
+  stdev,
   noGapMin,
   valueInBucket,
   yesLeadMax,
@@ -21,7 +22,7 @@ import {
   PAPER_YES_MIN_MODELP,
 } from "./paper-book";
 import { ensembleOk } from "./ensemble";
-import type { DeskEvent, DeskSnapshot, MarketBucket, Signal, TempKind, WeatherNow } from "./types";
+import type { DeskEvent, DeskSnapshot, EnsembleStats, MarketBucket, Signal, TempKind, WeatherNow } from "./types";
 
 const MIN_TRADE_PRICE = PAPER_MIN_PRICE;
 const MAX_TRADE_PRICE = PAPER_MAX_PRICE;
@@ -51,6 +52,19 @@ export function observedForSignal(wx: WeatherNow | undefined, sig: { date: strin
   if (sig.kind === "high") return wx.observedMaxC ?? null;
   if (sig.kind === "low") return wx.observedMinC ?? null;
   return null;
+}
+
+/** Display stats of the daily-MIN members pricing a low event (°C); null for highs. */
+export function lowEnsembleStats(wx: WeatherNow | undefined, eventDate: string, kind: TempKind): EnsembleStats | null {
+  if (kind !== "low") return null;
+  const m = membersForEvent(wx, eventDate, "low");
+  return {
+    members: m.length,
+    stdC: m.length ? stdev(m) : null,
+    minC: m.length ? Math.min(...m) : null,
+    maxC: m.length ? Math.max(...m) : null,
+    source: m.length ? (wx?.minSource ?? null) : null,
+  };
 }
 
 function weatherHasDatedEnsemble(w: WeatherNow | undefined) {
@@ -220,6 +234,7 @@ export function assembleDeskSnapshot(opts: {
       implied,
       modelHigh,
       observed,
+      lowEnsemble: lowEnsembleStats(wx, ev.eventDate, ev.kind),
       bestSignal: null,
     };
 

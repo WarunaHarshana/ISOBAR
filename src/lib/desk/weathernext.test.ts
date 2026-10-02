@@ -823,6 +823,7 @@ describe("WeatherNext daily-min members (low markets)", () => {
     assert.equal(log.filter((u) => u.includes("ensemble-api")).length, 0);
     assert.equal(wx.nyc.membersMinByDate[tomorrow].length, 50);
     assert.match(wx.nyc.source, /^WeatherNext 3/);
+    assert.match(wx.nyc.minSource ?? "", /^WeatherNext 3/);
   });
 
   it("loadWeather: WN min missing for a live low date → one Open-Meteo min request for that city only", async () => {
@@ -838,6 +839,7 @@ describe("WeatherNext daily-min members (low markets)", () => {
     assert.equal(minReq.length, 1);
     assert.match(minReq[0], /latitude=40\.7829&/);
     assert.ok(Object.values(wx.nyc.membersMinByDate).some((m) => m.length >= 50));
+    assert.equal(wx.nyc.minSource, "Open-Meteo ensemble");
     assert.deepEqual(wx.tokyo.membersMinByDate, {}, "no min members for a city without low markets");
     // Max members still WeatherNext (one provider per city and kind).
     assert.ok(Object.values(wx.nyc.membersByDate).every((m) => m.length === 50));
