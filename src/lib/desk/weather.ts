@@ -182,6 +182,7 @@ export function _resetEnsembleGuards() {
   glob.__isobarEnsInflight = new Map();
   glob.__isobarEnsNegUntil = 0;
   glob.__isobarEnsNeg = null;
+  _resetMetarState(0);
 }
 
 export function ensembleKey(cities: CityMeta[]) {
@@ -457,6 +458,67 @@ type MetarHistory = { latest: Map<string, Metar>; reports: Map<string, Metar[]> 
 const METAR_ROW_CAP = 400;
 const METAR_BATCH = 6;
 const METAR_TTL = 5 * 60_000;
+/**
+ * Per-attempt timeout. Healthy replies take < 1 s; the production aborts were
+ * responses that stalled mid-transfer and never finished, so fail fast and retry
+ * on a fresh request instead of waiting longer.
+ */
+const METAR_TIMEOUT_MS = 8_000;
+const METAR_ATTEMPTS = 3;
+/** In-flight aviationweather requests (their limit is 100 req/min; stay polite). */
+const METAR_CONCURRENCY = 3;
+/** A station's last good reports stand in for a failed refresh this long. */
+const METAR_LAST_GOOD_MS = 3 * 3600_000;
+/** aviationweather.gov asks for a custom User-Agent so automated filtering does not block us. */
+const METAR_UA = "IsobarDesk/1.0 (+https://isobar-production.up.railway.app; paper-only weather desk)";
+
+let metarBackoffMs = 1_000;
+let metarLastGood = new Map<string, { at: number; reports: Metar[] }>();
+
+/** Test helper — clear last-good METAR reports and set retry backoff. */
+export function _resetMetarState(backoffMs = 1_000) {
+  metarBackoffMs = backoffMs;
+  metarLastGood = new Map();
+}
+
+function limiter(n: number) {
+  let active = 0;
+  const queue: Array<() => void> = [];
+  return async <T>(fn: () => Promise<T>): Promise<T> => {
+    if (active >= n) await new Promise<void>((r) => queue.push(r));
+    else active++;
+    try {
+      return await fn();
+    } finally {
+      const next = queue.shift();
+      if (next) next();
+      else active--;
+    }
+  };
+}
+const metarSlot = limiter(METAR_CONCURRENCY);
+
+/** Timeouts, network errors, 429 and 5xx are worth another try; 4xx / bad JSON are not. */
+export function metarRetryable(err: unknown) {
+  if (!(err instanceof Error)) return false;
+  if (err.name === "AbortError" || err.name === "TimeoutError") return true;
+  if (err.name === "TypeError" && /fetch failed/i.test(err.message)) return true;
+  return /^(429|5\d\d) /.test(err.message);
+}
+
+async function fetchMetarRows(ids: string[], hours: number): Promise<Metar[]> {
+  const url = `https://aviationweather.gov/api/data/metar?ids=${ids.join(",")}&format=json&hours=${hours}`;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await metarSlot(() => fetchJson<Metar[]>(url, { headers: { "user-agent": METAR_UA } }, METAR_TIMEOUT_MS));
+    } catch (err) {
+      if (attempt >= METAR_ATTEMPTS || !metarRetryable(err)) throw err;
+      // Exponential backoff with jitter, outside the concurrency slot.
+      const base = metarBackoffMs * 2 ** (attempt - 1);
+      await new Promise((r) => setTimeout(r, base / 2 + Math.random() * base));
+    }
+  }
+}
 
 function localDateOf(ms: number, tz: string) {
   return new Intl.DateTimeFormat("en-CA", { timeZone: tz || "UTC" }).format(new Date(ms));
@@ -492,10 +554,7 @@ export function observedMaxForLocalDay(reports: Metar[], tz: string, now: number
 }
 
 async function fetchMetarBatch(ids: string[], hours: number): Promise<Metar[]> {
-  const url = `https://aviationweather.gov/api/data/metar?ids=${ids.join(",")}&format=json&hours=${hours}`;
-  const rows = await cached(`metarh:${ids.join(",")}:${hours}`, METAR_TTL, () =>
-    fetchJson<Metar[]>(url, { headers: { "user-agent": "IsobarDesk/1.0" } }),
-  );
+  const rows = await cached(`metarh:${ids.join(",")}:${hours}`, METAR_TTL, () => fetchMetarRows(ids, hours));
   const list = Array.isArray(rows) ? rows : [];
   // Possibly truncated → split and retry so no station loses its early-day reports.
   if (list.length >= METAR_ROW_CAP && ids.length > 1) {
@@ -518,12 +577,27 @@ async function loadMetarHistory(cities: CityMeta[], now = Date.now()): Promise<M
     batches.push({ ids: chunk, hours: Math.max(...chunk.map((id) => need.get(id)!)) });
   }
   const results = await Promise.all(
-    batches.map((b) =>
-      fetchMetarBatch(b.ids, b.hours).catch((err) => {
-        console.error("[isobar] METAR history batch failed", b.ids.join(","), err instanceof Error ? err.message : err);
-        return [] as Metar[];
-      }),
-    ),
+    batches.map(async (b) => {
+      try {
+        const rows = await fetchMetarBatch(b.ids, b.hours);
+        const at = Date.now();
+        for (const id of b.ids) metarLastGood.set(id, { at, reports: rows.filter((r) => r.icaoId === id) });
+        return rows;
+      } catch (err) {
+        // Keep each station's last good reports so one failed refresh does not blank its observed max
+        // (observedMaxForLocalDay still drops anything from a previous local day).
+        const kept = b.ids.flatMap((id) => {
+          const hit = metarLastGood.get(id);
+          return hit && Date.now() - hit.at < METAR_LAST_GOOD_MS ? [hit] : [];
+        });
+        console.error(
+          "[isobar] METAR history batch failed",
+          b.ids.join(","),
+          `${err instanceof Error ? err.message : String(err)}; kept last good for ${kept.length}/${b.ids.length}`,
+        );
+        return kept.flatMap((k) => k.reports);
+      }
+    }),
   );
   const reports = new Map<string, Metar[]>();
   const latest = new Map<string, Metar>();
