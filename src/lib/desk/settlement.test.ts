@@ -6,7 +6,14 @@ import { bucketProbability, leadSigmaC } from "./math.ts";
 import { assembleDeskSnapshot, observedForSignal } from "./snapshot.ts";
 import { plausibilityVeto } from "./plausibility.ts";
 import { _resetCache } from "./cache.ts";
-import { _resetEnsembleGuards, ensembleKey, hoursSinceLocalMidnight, loadWeather, observedMaxForLocalDay } from "./weather.ts";
+import {
+  _resetEnsembleGuards,
+  ensembleKey,
+  hoursSinceLocalMidnight,
+  loadWeather,
+  metarRetryable,
+  observedMaxForLocalDay,
+} from "./weather.ts";
 import { _resetWeatherNext, _setWeatherNextConfig } from "./weathernext.ts";
 import type { CityMeta, Signal, WeatherNow } from "./types.ts";
 import type { ParsedEvent } from "./polymarket.ts";
@@ -215,6 +222,92 @@ describe("#2 observed max = real METAR at/before now in the local day", () => {
       const wx = await loadWeather(cities);
       for (const c of cities) assert.equal(wx[c.id].observedMaxC, 12, c.id);
       assert.ok(seen.includes("KAAA") && seen.includes("KDDD"));
+    } finally {
+      console.error = orig;
+    }
+  });
+
+  it("METAR: retries an aborted / 5xx attempt and sends a descriptive User-Agent", async () => {
+    let calls = 0;
+    const agents: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("aviationweather.gov")) {
+        calls++;
+        agents.push(String((init?.headers as Record<string, string>)["user-agent"]));
+        if (calls === 1) throw new DOMException("This operation was aborted", "AbortError");
+        if (calls === 2) return json({ error: "busy" }, 502);
+        return json([{ icaoId: "KLGA", obsTime: Math.floor(Date.now() / 1000) - 60, temp: 21 }]);
+      }
+      return json({ error: true }, 503);
+    }) as typeof fetch;
+    const orig = console.error;
+    console.error = () => {};
+    try {
+      const wx = await loadWeather([nyc]);
+      assert.equal(calls, 3);
+      assert.equal(wx.nyc.observedMaxC, 21);
+      assert.ok(agents.every((a) => a.startsWith("IsobarDesk/") && a.includes("+https://")), agents.join(" | "));
+    } finally {
+      console.error = orig;
+    }
+  });
+
+  it("METAR: a batch that keeps failing keeps each station's last good observed max", async () => {
+    let down = false;
+    let calls = 0;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("aviationweather.gov")) {
+        calls++;
+        if (down) throw new DOMException("This operation was aborted", "AbortError");
+        return json([{ icaoId: "KLGA", obsTime: Math.floor(Date.now() / 1000) - 60, temp: 23.3 }]);
+      }
+      return json({ error: true }, 503);
+    }) as typeof fetch;
+    const orig = console.error;
+    const errors: string[] = [];
+    console.error = (...a: unknown[]) => void errors.push(a.join(" "));
+    try {
+      assert.equal((await loadWeather([nyc])).nyc.observedMaxC, 23.3);
+      _resetCache();
+      down = true;
+      calls = 0;
+      const wx = await loadWeather([nyc]);
+      assert.equal(calls, 3, "3 attempts before giving up");
+      assert.equal(wx.nyc.observedMaxC, 23.3);
+      assert.ok(errors.some((e) => e.includes("METAR history batch failed") && e.includes("kept last good for 1/1")));
+    } finally {
+      console.error = orig;
+    }
+  });
+
+  it("METAR: 4xx is not retried; at most 3 requests in flight", async () => {
+    assert.equal(metarRetryable(new Error("400 Bad Request for x")), false);
+    assert.equal(metarRetryable(new Error("429 Too Many Requests for x")), true);
+    assert.equal(metarRetryable(new Error("503 Service Unavailable for x")), true);
+    assert.equal(metarRetryable(new TypeError("fetch failed")), true);
+    let inflight = 0;
+    let peak = 0;
+    const cities: CityMeta[] = Array.from({ length: 30 }, (_, i) => ({ ...nyc, id: `s${i}`, icao: `K${String(i).padStart(3, "0")}` }));
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("aviationweather.gov")) {
+        inflight++;
+        peak = Math.max(peak, inflight);
+        await new Promise((r) => setTimeout(r, 15));
+        inflight--;
+        const ids = new URL(url).searchParams.get("ids")!.split(",");
+        return json(ids.map((id) => ({ icaoId: id, obsTime: Math.floor(Date.now() / 1000) - 60, temp: 10 })));
+      }
+      return json({ error: true }, 503);
+    }) as typeof fetch;
+    const orig = console.error;
+    console.error = () => {};
+    try {
+      const wx = await loadWeather(cities);
+      assert.ok(peak <= 3, `peak ${peak}`);
+      for (const c of cities) assert.equal(wx[c.id].observedMaxC, 10, c.id);
     } finally {
       console.error = orig;
     }
