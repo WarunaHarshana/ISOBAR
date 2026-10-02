@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { _resetCache } from "./cache.ts";
@@ -12,6 +15,7 @@ import {
   FETCH_BATCH_SIZE,
   probeLatestInit,
   dueInitCandidates,
+  EST_BYTES_PER_CITY,
   loadWeatherNext,
   memberRanks,
   parseFetchRows,
@@ -257,8 +261,17 @@ describe("WeatherNext SQL + config", () => {
     const base = { ISOBAR_WEATHERNEXT_PROJECT: "p", ISOBAR_WEATHERNEXT_DATASET: "d" };
     assert.equal(weatherNextConfig(base)!.maxEstimateBytes, 28 * 1024 ** 3);
     assert.equal(weatherNextConfig({ ...base, ISOBAR_WEATHERNEXT_MAX_ESTIMATE_GIB: "2048" })!.maxEstimateBytes, 2048 * 1024 ** 3);
-    assert.equal(weatherNextConfig(base)!.dailyCapBytes, 8 * 1024 ** 3);
-    assert.equal(weatherNextConfig(base)!.monthlyCapBytes, 240 * 1024 ** 3);
+    assert.equal(weatherNextConfig(base)!.dailyCapBytes, 20 * 1024 ** 3);
+    assert.equal(weatherNextConfig(base)!.monthlyCapBytes, 600 * 1024 ** 3);
+    assert.deepEqual(weatherNextConfig(base)!.initHours, [0, 12]);
+  });
+
+  it("pre-flight estimate covers the measured ~196 MiB/city bill; 2 full 47-city inits fit the default caps", () => {
+    assert.equal(EST_BYTES_PER_CITY, 200 * MIB);
+    const c = weatherNextConfig({ ISOBAR_WEATHERNEXT_PROJECT: "p", ISOBAR_WEATHERNEXT_DATASET: "d" })!;
+    const perInit = 47 * EST_BYTES_PER_CITY;
+    assert.ok(2 * perInit <= c.dailyCapBytes, "00Z + 12Z fit the daily cap");
+    assert.ok(31 * 2 * perInit <= c.monthlyCapBytes, "a 31-day month of 2 inits/day fits the monthly cap");
   });
 
   it("weatherNextConfig: off unless project + dataset set; parses JSON / base64 creds", () => {
@@ -405,12 +418,62 @@ describe("loadWeatherNext caching + budget (mocked BigQuery)", () => {
     console.warn = () => {};
     try {
       const a = await loadWeatherNext([nyc]);
-      // the dry-run probe is free; the ~95 MiB fetch does not fit
+      // the dry-run probe is free; the 200 MiB pre-flight estimate does not fit
       assert.equal(calls.length, 0);
       assert.equal(a.byCity.size, 0);
       assert.match(a.error ?? "", /budget/);
     } finally {
       console.warn = orig;
+    }
+  });
+
+  const manyCities = (n: number): CityMeta[] =>
+    Array.from({ length: n }, (_, i) => ({ ...nyc, id: `c${i}`, lat: 10 + i * 0.5, lon: 10 + i * 0.5 }));
+
+  it("daily cap hit mid-pass: never starts the batch that would cross it, keeps the partial load", async () => {
+    const cap = 2 * FETCH_BATCH_SIZE * EST_BYTES_PER_CITY; // room for exactly 2 full batches
+    _setWeatherNextConfig({ ...cfg, dailyCapBytes: cap });
+    runnerFor(defaultHandler(), FETCH_BATCH_SIZE * 196 * MIB);
+    const many = manyCities(FETCH_BATCH_SIZE * 2 + 3);
+    const orig = console.warn;
+    console.warn = () => {};
+    try {
+      const a = await loadWeatherNext(many);
+      assert.equal(calls.length, 2, "third batch not started");
+      assert.equal(a.byCity.size, FETCH_BATCH_SIZE * 2);
+      assert.equal(a.init, latestInit());
+      assert.equal(a.error, null, "partial load is served, not an error");
+      assert.ok(weatherNextUsage()!.dayBytes <= cap);
+      // backed off: no further billed jobs on the next tick
+      await loadWeatherNext(many);
+      assert.equal(calls.length, 2);
+    } finally {
+      console.warn = orig;
+    }
+  });
+
+  it("monthly cap is enforced per batch even with daily room left", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wn-usage-"));
+    try {
+      const day = new Date().toISOString().slice(0, 10);
+      const monthlyCapBytes = 600 * 1024 ** 3;
+      const remaining = FETCH_BATCH_SIZE * EST_BYTES_PER_CITY + 400 * MIB; // one batch + change
+      const usageFile = join(dir, "weathernext-usage.json");
+      writeFileSync(usageFile, JSON.stringify({ day, dayBytes: 0, month: day.slice(0, 7), monthBytes: monthlyCapBytes - remaining }));
+      _setWeatherNextConfig({ ...cfg, dailyCapBytes: 20 * 1024 ** 3, monthlyCapBytes, usageFile });
+      runnerFor(defaultHandler(), FETCH_BATCH_SIZE * 196 * MIB);
+      const orig = console.warn;
+      console.warn = () => {};
+      try {
+        const a = await loadWeatherNext(manyCities(FETCH_BATCH_SIZE * 2));
+        assert.equal(calls.length, 1);
+        assert.equal(a.byCity.size, FETCH_BATCH_SIZE);
+        assert.ok(weatherNextUsage()!.monthBytes <= monthlyCapBytes);
+      } finally {
+        console.warn = orig;
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 
