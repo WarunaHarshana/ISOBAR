@@ -22,8 +22,11 @@
  * geography): a point lookup reads whole clustered blocks, so the bill is
  * ~22 MiB per selected column per city per init regardless of how many
  * forecast hours we keep. We select 4 columns (hours, p10, p50, p90) → measured
- * 86 MiB per city per init (3-city smoke: 258 MiB billed). We only fetch 00Z/12Z inits by default, probe for a new
- * init only after it is due, and enforce daily + monthly byte caps (persisted
+ * ~196 MiB per city per init in production (~9 GiB for a full 47-city init).
+ * We only fetch 00Z/12Z inits by default (2 × ~9 GiB ≈ 18 GiB/day, ≈ 540
+ * GiB/month worst case, inside the 1 TiB/month free tier), probe for a new
+ * init only after it is due, and enforce daily + monthly byte caps (default
+ * 20 GiB/day, 600 GiB/month; persisted
  * to ISOBAR_DATA_DIR). When capped / unconfigured / failing we keep the last
  * good init (≤30 h old) or return nothing so weather.ts falls back to
  * Open-Meteo.
@@ -31,7 +34,7 @@
  * Estimates vs bills: BigQuery's pre-run estimate ignores clustering, so it is
  * the whole init_time partition for every selected column (measured on the
  * 0.05° view, 2026-10-01 12Z: init_time+geography ≈ 21 GB, 4 forecast columns
- * ≈ 1.47 TB) even though the bill is ~86 MiB/city. Project custom quotas
+ * ≈ 1.47 TB) even though the bill is ~196 MiB/city. Project custom quotas
  * (QueryUsagePerDay) and maximumBytesBilled are both enforced against that
  * estimate *before* the job runs. So:
  *   - the "is a new init out?" probe is a free dry run (estimate > 0 ⇔ the
@@ -40,9 +43,11 @@
  *     maxEstimateBytes (default 28 GiB, under a 30 GiB custom quota) we skip
  *     the job instead of letting BigQuery reject it, and back off;
  *   - the in-code daily/monthly caps count *billed* bytes (the real cost,
- *     min 10 MiB/job); the pre-flight cap check uses EST_BYTES_PER_CITY
- *     (95 MiB, above the measured 86 MiB) so we never start a batch that
- *     could cross a cap.
+ *     min 10 MiB/job); every batch is pre-flight checked with
+ *     EST_BYTES_PER_CITY (200 MiB, above the measured ~196 MiB) against both
+ *     the daily and the monthly cap, so we never start a batch that could
+ *     cross a cap. A pass that hits the cap mid-way keeps the cities already
+ *     fetched (partial load) and fills the rest once budget frees up.
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -66,8 +71,8 @@ const QUOTA_BACKOFF_MS = 60 * 60_000;
 export const FETCH_BATCH_SIZE = 8;
 /** Typical WeatherNext publish latency after init_time (observed ~6–7 h). */
 const PUBLISH_LATENCY_MS = 5 * 3600_000;
-/** Conservative estimate used for the pre-flight budget check. */
-export const EST_BYTES_PER_CITY = 95 * MIB;
+/** Conservative per-city bill used for the pre-flight budget check (measured ~196 MiB/city/init). */
+export const EST_BYTES_PER_CITY = 200 * MIB;
 
 export type WeatherNextConfig = {
   /** Project that runs (and pays for) the query jobs. */
@@ -213,8 +218,8 @@ export function weatherNextConfig(env: Record<string, string | undefined> = proc
     probeMs: num(env.ISOBAR_WEATHERNEXT_PROBE_MIN, 30, 10, 360) * 60_000,
     maxHours: Math.round(num(env.ISOBAR_WEATHERNEXT_MAX_HOURS, 120, 24, 360)),
     initHours: initHours.length ? [...new Set(initHours)].sort((a, b) => a - b) : [0, 12],
-    dailyCapBytes: num(env.ISOBAR_WEATHERNEXT_DAILY_GIB, 8, 0, 1024) * GIB,
-    monthlyCapBytes: num(env.ISOBAR_WEATHERNEXT_MONTHLY_GIB, 240, 0, 1024) * GIB,
+    dailyCapBytes: num(env.ISOBAR_WEATHERNEXT_DAILY_GIB, 20, 0, 1024) * GIB,
+    monthlyCapBytes: num(env.ISOBAR_WEATHERNEXT_MONTHLY_GIB, 600, 0, 1024) * GIB,
     maxEstimateBytes: num(env.ISOBAR_WEATHERNEXT_MAX_ESTIMATE_GIB, 28, 0, 1024 * 1024) * GIB,
     usageFile: join(dataDir, "weathernext-usage.json"),
     ...(credentials ? { credentials } : {}),
@@ -667,7 +672,7 @@ function fail(cities: CityMeta[], now: number, err: unknown): WeatherNextLoad {
   const quota = err instanceof WeatherNextEstimateError || isQuotaError(msg);
   st.lastError = budget ? msg : `WeatherNext failed: ${msg.slice(0, 240)}`;
   st.backoffUntil = now + (quota || budget ? QUOTA_BACKOFF_MS : ERROR_BACKOFF_MS);
-  if (budget) console.warn("[isobar] WeatherNext budget: keeping previous init", st.init);
+  if (budget) console.warn("[isobar] WeatherNext budget reached: serving init", st.init, `(${st.cities.size} cities)`);
   else console.error("[isobar]", st.lastError);
   return pick(cities, budget && st.init ? null : st.lastError);
 }
@@ -687,7 +692,9 @@ async function refresh(cfg: WeatherNextConfig, cities: CityMeta[]): Promise<Weat
       st.lastProbeAt = now;
       const latest = await probeLatestInit(cfg, run, candidates, st.init);
       if (latest) {
-        if (!withinBudget(cfg, now, EST_BYTES_PER_CITY * cities.length)) {
+        // Gate on the first batch only: fetchCities checks every batch against
+        // both caps before starting it, and keeps a partial load if it stops.
+        if (!withinBudget(cfg, now, EST_BYTES_PER_CITY * Math.min(cities.length, FETCH_BATCH_SIZE))) {
           console.warn("[isobar] WeatherNext budget: keeping previous init", st.init);
           return pick(cities, st.init ? null : "WeatherNext byte budget reached");
         }
@@ -702,7 +709,10 @@ async function refresh(cfg: WeatherNextConfig, cities: CityMeta[]): Promise<Weat
               ` (usage today ${Math.round((st.usage?.dayBytes ?? 0) / MIB)} MiB billed)`,
           );
         }
-        if (out.error) return fail(cities, now, out.error);
+        if (out.error) {
+          if (out.parsed.size) console.warn(`[isobar] WeatherNext partial load: ${out.parsed.size}/${cities.length} cities kept`);
+          return fail(cities, now, out.error);
+        }
         if (!out.parsed.size) throw new Error(`WeatherNext init ${latest} returned no cells`);
         return pick(cities, null);
       }

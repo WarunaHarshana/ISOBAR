@@ -38,7 +38,7 @@ Unset → the desk uses the Open-Meteo ensemble exactly as before.
 | `ISOBAR_WEATHERNEXT_INIT_HOURS` | UTC inits to use, default `0,12` (subset of `0,6,12,18`). |
 | `ISOBAR_WEATHERNEXT_PROBE_MIN` | Min minutes between "new init yet?" probes, default `30`. Probes only run while a due init is missing. |
 | `ISOBAR_WEATHERNEXT_MAX_HOURS` | Lead hours kept, default `120`. |
-| `ISOBAR_WEATHERNEXT_DAILY_GIB` / `ISOBAR_WEATHERNEXT_MONTHLY_GIB` | Hard byte caps, default `8` / `240` GiB. Counter persisted to `${ISOBAR_DATA_DIR}/weathernext-usage.json`. Over cap → keep last init (≤30 h) or fall back to Open-Meteo. |
+| `ISOBAR_WEATHERNEXT_DAILY_GIB` / `ISOBAR_WEATHERNEXT_MONTHLY_GIB` | Hard byte caps (billed bytes), default `20` / `600` GiB. Counter persisted to `${ISOBAR_DATA_DIR}/weathernext-usage.json`. Over cap → keep last init (≤30 h) or fall back to Open-Meteo. |
 | `ISOBAR_WEATHERNEXT_MAX_ESTIMATE_GIB` | Pre-run limit, default `28`. Every billed job is dry-run first; if BigQuery's estimate is above this the job is not started (back off 1 h, Open-Meteo fallback). Keep it below the project's `QueryUsagePerDay` custom quota. |
 | `ISOBAR_WEATHERNEXT_DISABLED` | `true` = kill switch. |
 
@@ -56,17 +56,20 @@ daily max is the max over that city-local date. Under that assumption this is ex
 real hour-to-hour correlation is slightly below 1, so it is a small low bias on the mean max. A local date is only
 emitted when the init covers local 11:00–23:00; otherwise that date has no members and is not traded.
 
-Cost: point lookups are pruned by geography clustering, so the bill ≈ 86 MiB per city per init (4 columns). The
+Cost: point lookups are pruned by geography clustering, so the bill ≈ 196 MiB per city per init (4 columns; measured in
+production: ~9 GiB per full 47-city init). The
 "new init?" probe is a dry run (`SELECT init_time … WHERE init_time = <init>`; estimate > 0 ⇔ published), so it is free.
-Fetches run in batches of 8 cities. `0,12` inits × ≤40 active cities ≈ 6.7 GiB/day ≈ 200 GiB/month, capped at
-8 GiB/day and 240 GiB/month (inside the 1 TiB/month free tier). The caps count **billed** bytes (`totalBytesBilled`,
-min 10 MiB/job); the pre-flight cap check uses 95 MiB/city so a batch never starts if it could cross a cap.
+Fetches run in batches of 8 cities. `0,12` inits × 47 cities ≈ 18 GiB/day ≈ 540 GiB/month worst case, capped at
+20 GiB/day and 600 GiB/month (inside the 1 TiB/month free tier). The caps count **billed** bytes (`totalBytesBilled`,
+min 10 MiB/job); every batch is pre-flight checked at 200 MiB/city against both the daily and monthly cap, so a batch
+never starts if it could cross either cap. If the cap is hit mid-pass the cities already fetched are kept (partial
+load) and the rest are filled from the same init once budget frees up; uncovered cities use Open-Meteo meanwhile.
 
 **Estimate ≠ bill.** BigQuery's pre-run estimate ignores clustering: it is the whole init_time partition for every
 selected column (0.05° view, measured 2026-10-01: init_time only ≈ 1.2–5 GB, init_time+geography ≈ 21 GB, the 4
 forecast columns ≈ 1.47 TB per init regardless of city count). A project `QueryUsagePerDay` custom quota and
 `maximumBytesBilled` are both checked against that estimate *before* running, so with a custom quota below ~1.5 TiB
-the fetch is rejected ("Custom quota exceeded") even though it would bill ~86 MiB/city. The desk detects this with
+the fetch is rejected ("Custom quota exceeded") even though it would bill ~196 MiB/city. The desk detects this with
 the free dry run and skips the job (see `ISOBAR_WEATHERNEXT_MAX_ESTIMATE_GIB`). To actually run WeatherNext with a
 custom quota in place, either raise the quota above the estimate (and the env var with it; the in-code billed-byte
 caps still bound real spend), or run jobs from a billing project without that quota.

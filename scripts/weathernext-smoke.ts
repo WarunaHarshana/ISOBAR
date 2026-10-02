@@ -6,7 +6,7 @@
 //   ISOBAR_DATA_DIR=/tmp/isobar-smoke \
 //   node --experimental-strip-types --import ./scripts/ts-test-resolve.mjs scripts/weathernext-smoke.ts nyc london tokyo
 //
-// Cost: probe is a free dry run; ~90 MiB per city billed (fetch is dry-run first and skipped if the
+// Cost: probe is a free dry run; ~196 MiB per city billed (fetch is dry-run first and skipped if the
 // estimate exceeds ISOBAR_WEATHERNEXT_MAX_ESTIMATE_GIB).
 import { CITIES } from "../src/lib/desk/cities.ts";
 import { loadWeatherNext, weatherNextUsage } from "../src/lib/desk/weathernext.ts";
