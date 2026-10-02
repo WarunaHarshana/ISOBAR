@@ -42,7 +42,15 @@ export type MarketBucket = {
   volume24hr: number;
   clobYes: string | null;
   clobNo: string | null;
+  /** Raw model probability (bias-corrected WeatherNext / intraday), before the market blend. */
   modelP: number;
+  /** Tradeable probability: w·modelP + (1 − w)·marketMid (0 on the observation's settled side). */
+  blendP?: number;
+  /** YES mid used in the blend: (bid + ask) / 2, else the Gamma price. */
+  marketMid?: number | null;
+  /** Model weight w of the blend for this event at snapshot time. */
+  blendW?: number;
+  /** Edges: blendP − executable price − taker fee per share. */
   edgeYes: number;
   edgeNo: number;
   kellyYes: number;
@@ -145,7 +153,14 @@ export type Signal = {
   label: string;
   side: Side;
   marketP: number;
+  /** Probability the trade is sized on (side-adjusted): the model/market blend. */
   modelP: number;
+  /** Side-adjusted raw model probability (pre-blend). */
+  rawModelP?: number;
+  /** Side-adjusted market mid used in the blend. */
+  marketMid?: number | null;
+  blendW?: number;
+  /** Net edge: modelP − executable price − taker fee. */
   edge: number;
   kelly: number;
   volume24hr: number;
@@ -182,6 +197,18 @@ export type PaperFill = {
   placedAt: string;
   status: "open" | "won" | "lost";
   payout: number;
+  /** Taker fee paid at fill (USDC; 0.05 × shares × p × (1 − p)); subtracted from PnL. Older fills: none. */
+  fee?: number;
+  /** Kelly target stake before the book walk; cost < requestedStake ⇔ depth-limited partial fill. */
+  requestedStake?: number;
+  /** Book levels consumed by the walk (price is the VWAP over them). */
+  bookLevels?: number;
+  depthLimited?: boolean;
+  /** Limit price of the walk (highest price still clearing the edge floor net of fee). */
+  limitPrice?: number;
+  rawModelP?: number;
+  marketMid?: number | null;
+  blendW?: number;
 };
 
 export type BotSettings = {

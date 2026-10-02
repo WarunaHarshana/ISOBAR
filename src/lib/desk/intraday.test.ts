@@ -13,6 +13,11 @@ import { refreshOpenFillsFromGamma } from "./paper-worker.ts";
 import { _resetCache } from "./cache.ts";
 import type { CityMeta, PaperFill, Signal, WeatherNow } from "./types.ts";
 import type { ParsedEvent } from "./polymarket.ts";
+import { LEGACY_STRATEGY, _setStrategyParams } from "./strategy.ts";
+
+// These scenarios pin the pre-backtest pricing (raw model, no fee/bias/blend, 3¢ YES floor);
+// the backtest-fitted strategy is covered in strategy.test.ts.
+_setStrategyParams(LEGACY_STRATEGY);
 
 const chengdu: CityMeta = { id: "chengdu", name: "Chengdu", aliases: [], lat: 30.576, lon: 103.95, tz: "Asia/Shanghai", icao: "ZUUU", country: "CN" };
 const DATE = "2026-10-02";

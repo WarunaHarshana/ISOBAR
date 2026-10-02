@@ -28,6 +28,11 @@ import { _resetWeatherNext, _setWeatherNextConfig } from "./weathernext.ts";
 import { tickPaperWorker } from "./paper-worker.ts";
 import type { CityMeta, PaperFill, Signal, WeatherNow } from "./types.ts";
 import type { ParsedEvent } from "./polymarket.ts";
+import { LEGACY_STRATEGY, _setStrategyParams } from "./strategy.ts";
+
+// These scenarios pin the pre-backtest pricing (raw model, no fee/bias/blend, 3¢ YES floor);
+// the backtest-fitted strategy is covered in strategy.test.ts.
+_setStrategyParams(LEGACY_STRATEGY);
 
 const nyc: CityMeta = {
   id: "nyc",
@@ -380,7 +385,7 @@ describe("paper book: ledger, tickets, YES floor", () => {
     assert.equal(t[0].city, "New York City");
   });
 
-  it("YES may fill from 3¢, NO still needs 5¢; one ticket per city-date", () => {
+  it("legacy YES floor 3¢ (configurable), NO still needs 5¢; one ticket per city-date", () => {
     const base = { ...emptyBook(), fills: [] as PaperFill[] };
     const s = (side: "YES" | "NO", p: number): Signal => ({
       id: `m-${side}`, eventId: "e", marketId: "m", cityId: "nyc", cityName: "NYC", date: FUTURE, kind: "high", unit: "C",

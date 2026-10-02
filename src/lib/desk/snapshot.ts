@@ -24,13 +24,13 @@ import {
   PAPER_MAX_PRICE,
   PAPER_MIN_EDGE,
   PAPER_MIN_PRICE,
-  PAPER_MIN_PRICE_YES,
   PAPER_FAVORITE_GUARD,
   PAPER_FAVORITE_GUARD_MODELP,
   PAPER_LIVE_DAY_DEFER,
   PAPER_NO_MAX_YES,
   PAPER_YES_MIN_MODELP,
 } from "./paper-book";
+import { blendProb, blendWeight, debiasMembers, marketMid, strategy, takerFee } from "./strategy";
 import { ensembleOk } from "./ensemble";
 import type { DeskEvent, DeskSnapshot, EnsembleStats, MarketBucket, Signal, TempKind, WeatherNow } from "./types";
 
@@ -96,11 +96,13 @@ export type PricingModel = {
  */
 export function pricingModel(
   wx: WeatherNow | undefined,
-  sig: { date: string; kind: TempKind },
+  sig: { date: string; kind: TempKind; cityId?: string },
   tz: string | undefined,
   now = new Date(),
 ): PricingModel {
-  const members = membersForEvent(wx, sig.date, sig.kind);
+  // Per-station bias correction (strategy.ts / model-params.ts): members − shrunk (forecast − settled).
+  const raw = membersForEvent(wx, sig.date, sig.kind);
+  const members = sig.cityId ? debiasMembers(raw, sig.cityId, sig.kind) : raw;
   const observedC = observedForSignal(wx, sig);
   if (!wx || observedC == null || !ensembleOk(members)) return { members, intraday: null, supportMembers: members };
   const bw = kdeBandwidth(members, "C", sig.date, tz, now);
@@ -200,7 +202,12 @@ export function assembleDeskSnapshot(opts: {
     const low = ev.kind === "low";
     // Daily-MAX members for highs, daily-MIN members for lows (never the other kind).
     const tz = ev.city.tz;
-    const pm = pricingModel(wx, { date: ev.eventDate, kind: ev.kind }, tz, now);
+    const pm = pricingModel(wx, { date: ev.eventDate, kind: ev.kind, cityId: ev.city.id }, tz, now);
+    const strat = strategy();
+    const minPriceYes = strat.minPriceYes;
+    // Model weight of the model/market blend (live day: by local hour; later dates: one number).
+    const w = blendWeight(ev.eventDate, tz, now);
+    const fee = (p: number) => takerFee(p, strat.takerFeeRate);
     const members = pm.members;
     const enough = ensembleOk(members);
     const support = pm.supportMembers;
@@ -226,11 +233,17 @@ export function assembleDeskSnapshot(opts: {
           ? intradayBucketProbability(pm.intraday, m.bound.lo, m.bound.hi, ev.unit)
           : bucketProbability(members, m.bound.lo, m.bound.hi, ev.unit, ev.eventDate, observedC, tz, now, ev.kind);
       let modelP = modelPRaw;
+      let settledOut = false;
       if (enough && obsU != null) {
         // Settled side of the observation: a high can't end below its max, a low can't end above its min.
-        if (!low && Number.isFinite(m.bound.hi) && m.bound.hi <= obsU + 1e-6) modelP = 0;
-        if (low && Number.isFinite(m.bound.lo) && m.bound.lo > obsU + 1e-6) modelP = 0;
+        if (!low && Number.isFinite(m.bound.hi) && m.bound.hi <= obsU + 1e-6) settledOut = true;
+        if (low && Number.isFinite(m.bound.lo) && m.bound.lo > obsU + 1e-6) settledOut = true;
+        if (settledOut) modelP = 0;
       }
+      // Tradeable probability: blend of model and market mid (a bucket the observation already
+      // killed stays at 0 whatever the market says). Edges below are against this, net of fee.
+      const mid0 = marketMid(m);
+      const blendP = !enough || settledOut ? 0 : blendProb(modelP, mid0, w);
       // Near-certainty gate: YES needs a raw member near the bucket (KDE tails are not support);
       // NO never shorts a supported bucket, the bucket the observation sits in, a close bucket,
       // or an 80%+ crowd favorite. modelP itself is never mutated by the gate.
@@ -242,9 +255,9 @@ export function assembleDeskSnapshot(opts: {
       // Edges are against the executable price (YES ask / NO = 1 − YES bid), not the mid.
       const yesExec = execPrice("YES", m);
       const noExec = execPrice("NO", m);
-      const edgeYes = enough && supported ? modelP - yesExec : 0;
-      const edgeNo = noOk ? 1 - modelP - noExec : 0;
-      const yesPxOk = yesExec >= PAPER_MIN_PRICE_YES && yesExec <= MAX_TRADE_PRICE && m.yesPrice < SETTLED_PRICE;
+      const edgeYes = enough && supported ? blendP - yesExec - fee(yesExec) : 0;
+      const edgeNo = noOk ? 1 - blendP - noExec - fee(noExec) : 0;
+      const yesPxOk = yesExec >= minPriceYes && yesExec <= MAX_TRADE_PRICE && m.yesPrice < SETTLED_PRICE;
       const noPxOk = noExec >= MIN_TRADE_PRICE && noExec <= MAX_TRADE_PRICE && m.noPrice < SETTLED_PRICE;
       const tradeable =
         enough &&
@@ -269,13 +282,16 @@ export function assembleDeskSnapshot(opts: {
         spread: m.spread ?? null,
         volume: Number(m.volume ?? 0) || 0,
         volume24hr: Number(m.volume24hr ?? 0) || 0,
-        clobYes: null,
-        clobNo: null,
+        clobYes: m.tokens?.[0] ?? null,
+        clobNo: m.tokens?.[1] ?? null,
         modelP,
+        blendP,
+        marketMid: mid0,
+        blendW: w,
         edgeYes,
         edgeNo,
-        kellyYes: enough && supported ? kellyFraction(modelP, yesExec) : 0,
-        kellyNo: noOk ? kellyFraction(1 - modelP, noExec) : 0,
+        kellyYes: enough && supported ? kellyFraction(blendP, yesExec + fee(yesExec)) : 0,
+        kellyNo: noOk ? kellyFraction(1 - blendP, noExec + fee(noExec)) : 0,
         tradeable,
       };
     });
@@ -363,7 +379,7 @@ export function assembleDeskSnapshot(opts: {
           b.marketId === modalYes.marketId &&
           yesLeadOk &&
           b.edgeYes >= MIN_EDGE &&
-          execPrice("YES", b) >= PAPER_MIN_PRICE_YES &&
+          execPrice("YES", b) >= minPriceYes &&
           execPrice("YES", b) <= MAX_TRADE_PRICE &&
           b.yesPrice < SETTLED_PRICE &&
           b.modelP >= PAPER_YES_MIN_MODELP &&
@@ -384,13 +400,16 @@ export function assembleDeskSnapshot(opts: {
             label: b.label,
             side: "YES",
             marketP: execPrice("YES", b),
-            modelP: b.modelP,
+            modelP: b.blendP ?? b.modelP,
+            rawModelP: b.modelP,
+            marketMid: b.marketMid ?? null,
+            blendW: w,
             edge: b.edgeYes,
             kelly: b.kellyYes,
             volume24hr: b.volume24hr || event.volume24hr,
           });
         }
-        const noModel = 1 - b.modelP;
+        const noModel = 1 - (b.blendP ?? b.modelP);
         if (
           b.edgeNo >= MIN_EDGE &&
           execPrice("NO", b) >= MIN_TRADE_PRICE &&
@@ -414,6 +433,9 @@ export function assembleDeskSnapshot(opts: {
             side: "NO",
             marketP: execPrice("NO", b),
             modelP: noModel,
+            rawModelP: 1 - b.modelP,
+            marketMid: b.marketMid != null ? 1 - b.marketMid : null,
+            blendW: w,
             edge: b.edgeNo,
             kelly: b.kellyNo,
             volume24hr: b.volume24hr || event.volume24hr,
