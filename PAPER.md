@@ -88,6 +88,25 @@ caps still bound real spend), or run jobs from a billing project without that qu
 
 Smoke test: `scripts/weathernext-smoke.ts` (one dry-run probe + one fetch).
 
+### Open-Meteo fallback (quiet)
+
+Open-Meteo free tier: 600 / min, 5 000 / h, 10 000 / day **weighted** calls. An ensemble request weighs
+(variables × members) / 10 per location, so `ecmwf_ifs025` (51 members) with `daily=temperature_2m_max` is 5.1 calls
+per city (the old max+min request was 10.2 → ~490 per 48-city pass; at the old 8-min cache that was ~3 700/h and
+blew the daily limit within hours, after which every request 429'd).
+
+- **Ensemble**: requested only for cities WeatherNext does not cover with a fresh init (none / stale / cap / error).
+  Cached per city; a city is re-requested at most every `ensembleRefreshMs(n)` = max(30 min, interval keeping the
+  ensemble under 6 000 weighted calls/day) → 30 min for a few cities, ~59 min for all 48. Last good members serve for
+  up to 12 h.
+- **Forecast** (dashboard hourly/current, `previous-runs-api`): cached per city, refreshed every 30 min (~1 weighted
+  call/city), last good kept 6 h.
+- **429 / 403**: the endpoint (ensemble or forecast, separately) goes on cooldown: Retry-After if sent (+≤10 % jitter),
+  else exponential backoff 60 s × 2^(n-1) with ±25 % jitter, capped at 1 h (Open-Meteo's reason text raises the
+  floor: "Hourly" → next UTC hour, "Daily" → ≥30 min, cap 6 h). No requests during cooldown; last good data keeps
+  serving. One log line per cooldown (`Open-Meteo ensemble HTTP 429 …: cooling down …`) and one on recovery; other
+  failures are logged on change, not per tick, and retried at most every 2 min.
+
 Never attach Polymarket/CLOB secrets to this service. Do not wire this to poly5m / poly15m live services.
 
 ## Health
