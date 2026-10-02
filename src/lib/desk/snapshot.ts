@@ -1,10 +1,27 @@
 import { convertTemp } from "../utils";
 import { loadWeatherEvents, type ParsedEvent } from "./polymarket";
 import { loadWeather } from "./weather";
-import { bucketProbability, impliedTemp, kellyFraction, mean } from "./math";
-import { PAPER_MAX_PRICE, PAPER_MIN_EDGE, PAPER_MIN_PRICE } from "./paper-book";
+import {
+  bucketMid,
+  bucketProbability,
+  impliedTemp,
+  kellyFraction,
+  mean,
+  membersNearBucket,
+  noGapMin,
+  valueInBucket,
+  yesLeadMax,
+} from "./math";
+import {
+  PAPER_MAX_PRICE,
+  PAPER_MIN_EDGE,
+  PAPER_MIN_PRICE,
+  PAPER_MIN_PRICE_YES,
+  PAPER_NO_MAX_YES,
+  PAPER_YES_MIN_MODELP,
+} from "./paper-book";
 import { ensembleOk } from "./ensemble";
-import type { DeskEvent, DeskSnapshot, MarketBucket, Signal, WeatherNow } from "./types";
+import type { DeskEvent, DeskSnapshot, MarketBucket, Signal, TempKind, WeatherNow } from "./types";
 
 const MIN_TRADE_PRICE = PAPER_MIN_PRICE;
 const MAX_TRADE_PRICE = PAPER_MAX_PRICE;
@@ -14,24 +31,45 @@ const SETTLED_PRICE = 0.98;
 
 export const ENSEMBLE_UNAVAILABLE = "Forecast ensemble unavailable (WeatherNext 3 / Open-Meteo, need >=8 members)";
 
-/** Dated members only. Never fall back to membersC (may be another calendar day). */
-export function membersForEvent(wx: WeatherNow | undefined, eventDate: string): number[] {
-  const dated = wx?.membersByDate?.[eventDate];
+/**
+ * Dated members by kind: daily-MAX members for high markets, daily-MIN members
+ * for low markets. Never fall back to membersC (may be another calendar day)
+ * and never price a low with max members.
+ */
+export function membersForEvent(wx: WeatherNow | undefined, eventDate: string, kind: TempKind = "high"): number[] {
+  const dated = kind === "low" ? wx?.membersMinByDate?.[eventDate] : wx?.membersByDate?.[eventDate];
   return Array.isArray(dated) ? dated : [];
 }
 
 /**
- * Observed daily max usable for a signal: only HIGH markets, only when the
- * signal's date is the city's current local date (never today's obs for tomorrow).
+ * Observed extreme usable for a signal: the observed max for HIGH markets, the
+ * observed min for LOW markets, and only when the signal's date is the city's
+ * current local date (never today's obs for tomorrow).
  */
 export function observedForSignal(wx: WeatherNow | undefined, sig: { date: string; kind: string }): number | null {
-  if (!wx || sig.kind !== "high" || wx.localDate !== sig.date) return null;
-  return wx.observedMaxC ?? null;
+  if (!wx || wx.localDate !== sig.date) return null;
+  if (sig.kind === "high") return wx.observedMaxC ?? null;
+  if (sig.kind === "low") return wx.observedMinC ?? null;
+  return null;
 }
 
 function weatherHasDatedEnsemble(w: WeatherNow | undefined) {
   if (!w) return false;
-  return Object.values(w.membersByDate ?? {}).some((m) => ensembleOk(m));
+  return (
+    Object.values(w.membersByDate ?? {}).some((m) => ensembleOk(m)) ||
+    Object.values(w.membersMinByDate ?? {}).some((m) => ensembleOk(m))
+  );
+}
+
+/** Live low markets per city → event dates (only these cities get daily-min members). */
+export function lowDatesFor(events: Pick<ParsedEvent, "kind" | "city" | "eventDate">[]): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const ev of events) {
+    if (ev.kind !== "low") continue;
+    const list = (out[ev.city.id] ??= []);
+    if (!list.includes(ev.eventDate)) list.push(ev.eventDate);
+  }
+  return out;
 }
 
 export async function buildDeskSnapshot(): Promise<DeskSnapshot> {
@@ -45,7 +83,7 @@ export async function buildDeskSnapshot(): Promise<DeskSnapshot> {
   const cities = [...new Map(events.map((e) => [e.city.id, e.city])).values()];
   let weather: Record<string, WeatherNow> = {};
   try {
-    weather = await loadWeather(cities);
+    weather = await loadWeather(cities, { lowDates: lowDatesFor(events) });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Weather feed unavailable";
     warning = warning ? `${warning} \u00b7 ${msg}` : msg;
@@ -65,7 +103,7 @@ export function assembleDeskSnapshot(opts: {
     for (const part of w.source.split(" \u00b7 ")) if (part) sources.add(part);
   }
 
-  const anyDated = events.some((ev) => ensembleOk(membersForEvent(weather[ev.city.id], ev.eventDate)));
+  const anyDated = events.some((ev) => ensembleOk(membersForEvent(weather[ev.city.id], ev.eventDate, ev.kind)));
   if (events.length && !anyDated) {
     const hasAny = Object.values(weather).some(weatherHasDatedEnsemble);
     const msg = hasAny
@@ -79,32 +117,50 @@ export function assembleDeskSnapshot(opts: {
 
   for (const ev of events) {
     const wx = weather[ev.city.id];
-    const members = membersForEvent(wx, ev.eventDate);
-    // Members are daily-MAX distributions: never price "lowest temperature" events with them.
-    const enough = ev.kind === "high" && ensembleOk(members);
-    const isLiveDay = wx?.localDate === ev.eventDate;
+    const low = ev.kind === "low";
+    // Daily-MAX members for highs, daily-MIN members for lows (never the other kind).
+    const members = membersForEvent(wx, ev.eventDate, ev.kind);
+    const enough = ensembleOk(members);
+    const tz = ev.city.tz;
     const dayEnded = Boolean(wx?.localDate && wx.localDate > ev.eventDate);
-    // Observed daily max only conditions HIGH markets on the city's current local day.
-    const observedC = isLiveDay && ev.kind === "high" ? (wx?.observedMaxC ?? null) : null;
+    // Observed max (high) / observed min (low), only on the city's current local day.
+    const observedC = observedForSignal(wx, { date: ev.eventDate, kind: ev.kind });
+    const obsU = observedC != null ? convertTemp(observedC, ev.unit) : null;
+    // A low is usually set by early morning: on its live day, without an observed min (no METAR
+    // at the settlement station, e.g. HKO, or METAR down) it is priced for display but never traded.
+    const lowBlind = low && wx?.localDate === ev.eventDate && observedC == null;
+    const mu = enough ? mean(members.map((m) => convertTemp(m, ev.unit))) : 0;
+    const gap = noGapMin(ev.unit);
+    const near = (lo: number, hi: number) => enough && membersNearBucket(members, lo, hi, ev.unit, ev.eventDate, tz);
     const buckets: MarketBucket[] = ev.markets.map((m) => {
       const modelPRaw = enough
-        ? bucketProbability(members, m.bound.lo, m.bound.hi, ev.unit, ev.eventDate, observedC, ev.city.tz)
+        ? bucketProbability(members, m.bound.lo, m.bound.hi, ev.unit, ev.eventDate, observedC, tz, undefined, ev.kind)
         : 0;
       let modelP = modelPRaw;
-      if (enough && observedC != null && Number.isFinite(m.bound.hi)) {
-        const obsU = convertTemp(observedC, ev.unit);
-        if (m.bound.hi <= obsU + 1e-6) modelP = 0;
+      if (enough && obsU != null) {
+        // Settled side of the observation: a high can't end below its max, a low can't end above its min.
+        if (!low && Number.isFinite(m.bound.hi) && m.bound.hi <= obsU + 1e-6) modelP = 0;
+        if (low && Number.isFinite(m.bound.lo) && m.bound.lo > obsU + 1e-6) modelP = 0;
       }
-      const edgeYes = enough ? modelP - m.yesPrice : 0;
-      const edgeNo = enough ? 1 - modelP - m.noPrice : 0;
+      // Near-certainty gate: YES needs a raw member near the bucket (KDE tails are not support);
+      // NO never shorts a supported bucket, the bucket the observation sits in, a close bucket,
+      // or an 80%+ crowd favorite. modelP itself is never mutated by the gate.
+      const supported = near(m.bound.lo, m.bound.hi);
+      const obsIn = obsU != null && valueInBucket(obsU, m.bound.lo, m.bound.hi);
+      const mid = bucketMid(m.bound.lo, m.bound.hi);
+      const far = Math.abs(mid - mu) >= gap && (obsU == null || Math.abs(mid - obsU) >= gap);
+      const noOk = enough && !supported && !obsIn && far && m.yesPrice < PAPER_NO_MAX_YES;
+      const edgeYes = enough && supported ? modelP - m.yesPrice : 0;
+      const edgeNo = noOk ? 1 - modelP - m.noPrice : 0;
+      const yesPxOk = m.yesPrice >= PAPER_MIN_PRICE_YES && m.yesPrice <= MAX_TRADE_PRICE && m.yesPrice < SETTLED_PRICE;
+      const noPxOk = m.noPrice >= MIN_TRADE_PRICE && m.noPrice <= MAX_TRADE_PRICE && m.noPrice < SETTLED_PRICE;
       const tradeable =
         enough &&
         !dayEnded &&
-        m.yesPrice >= MIN_TRADE_PRICE &&
-        m.yesPrice <= MAX_TRADE_PRICE &&
-        m.yesPrice < SETTLED_PRICE &&
+        !lowBlind &&
         m.noPrice < SETTLED_PRICE &&
-        (Math.abs(edgeYes) >= MIN_EDGE || Math.abs(edgeNo) >= MIN_EDGE);
+        m.yesPrice < SETTLED_PRICE &&
+        ((yesPxOk && edgeYes >= MIN_EDGE) || (noPxOk && edgeNo >= MIN_EDGE));
       return {
         marketId: String(m.id),
         conditionId: m.conditionId ?? "",
@@ -126,15 +182,15 @@ export function assembleDeskSnapshot(opts: {
         modelP,
         edgeYes,
         edgeNo,
-        kellyYes: enough ? kellyFraction(modelP, m.yesPrice) : 0,
-        kellyNo: enough ? kellyFraction(1 - modelP, m.noPrice) : 0,
+        kellyYes: enough && supported ? kellyFraction(modelP, m.yesPrice) : 0,
+        kellyNo: noOk ? kellyFraction(1 - modelP, m.noPrice) : 0,
         tradeable,
       };
     });
 
     const modelHigh = enough
       ? convertTemp(mean(members), ev.unit)
-      : wx?.modelMeanC != null
+      : !low && wx?.modelMeanC != null
         ? convertTemp(wx.modelMeanC, ev.unit)
         : null;
     const observed =
@@ -167,19 +223,30 @@ export function assembleDeskSnapshot(opts: {
       bestSignal: null,
     };
 
-    if (enough && !warning && !dayEnded) {
+    if (enough && !warning && !dayEnded && !lowBlind) {
+      // YES only on the modal bucket: highest modelP (≥ 20%) with member support.
+      const modalYes = buckets
+        .filter((b) => b.modelP >= PAPER_YES_MIN_MODELP && near(b.lo, b.hi))
+        .sort((a, b) => b.modelP - a.modelP)[0];
+      const lead = yesLeadMax(ev.unit);
       for (const b of buckets) {
         const spreadOk = b.spread == null || (Number.isFinite(b.spread) && b.spread <= MAX_SPREAD);
         if (!spreadOk) continue;
 
         const candidates: Array<Omit<Signal, "id">> = [];
+        // Live day: the YES bucket can't be miles past the observed extreme (above the max / below the min).
+        const yesLeadOk =
+          obsU == null || (low ? !Number.isFinite(b.hi) || b.hi >= obsU - lead : !Number.isFinite(b.lo) || b.lo <= obsU + lead);
         if (
+          modalYes != null &&
+          b.marketId === modalYes.marketId &&
+          yesLeadOk &&
           b.edgeYes >= MIN_EDGE &&
-          b.yesPrice >= MIN_TRADE_PRICE &&
+          b.yesPrice >= PAPER_MIN_PRICE_YES &&
           b.yesPrice <= MAX_TRADE_PRICE &&
           b.yesPrice < SETTLED_PRICE &&
-          b.modelP > 0.05 &&
-          b.modelP < 0.95
+          b.modelP >= PAPER_YES_MIN_MODELP &&
+          near(b.lo, b.hi)
         ) {
           candidates.push({
             eventId: event.eventId,
@@ -206,7 +273,9 @@ export function assembleDeskSnapshot(opts: {
           b.noPrice <= MAX_TRADE_PRICE &&
           b.noPrice < SETTLED_PRICE &&
           noModel > 0.05 &&
-          noModel < 0.95
+          !near(b.lo, b.hi) &&
+          !(obsU != null && valueInBucket(obsU, b.lo, b.hi)) &&
+          b.yesPrice < PAPER_NO_MAX_YES
         ) {
           candidates.push({
             eventId: event.eventId,
@@ -237,7 +306,11 @@ export function assembleDeskSnapshot(opts: {
     deskEvents.push(event);
   }
 
-  signals.sort((a, b) => b.edge - a.edge);
+  // Member-supported YES (modal bucket) before NO, then by edge. The worker fills in this order.
+  signals.sort((a, b) => {
+    if (a.side !== b.side) return a.side === "YES" ? -1 : 1;
+    return b.edge - a.edge;
+  });
   deskEvents.sort((a, b) => b.volume24hr - a.volume24hr);
 
   for (const w of Object.values(weather)) {

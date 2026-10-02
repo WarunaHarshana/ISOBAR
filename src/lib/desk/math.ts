@@ -1,5 +1,5 @@
 import { convertTemp } from "@/lib/utils";
-import type { TempUnit } from "./types";
+import type { TempKind, TempUnit } from "./types";
 
 /** Abramowitz & Stegun erf approximation. */
 export function erf(x: number) {
@@ -66,9 +66,70 @@ export function leadSigmaC(eventDate: string, now = new Date(), tz?: string) {
   return 0.7 + Math.min(Math.max(days, 0), 5) * 0.35;
 }
 
-export function adjustMembersForObserved(members: number[], observedC: number | null) {
+/** KDE bandwidth used by bucketProbability (same formula, no observed widening). */
+export function kdeBandwidth(membersConverted: number[], unit: TempUnit, eventDate: string, tz?: string, now = new Date()) {
+  return Math.max(
+    stdev(membersConverted) * 0.45,
+    unit === "F" ? 1.1 : 0.65,
+    leadSigmaC(eventDate, now, tz) * (unit === "F" ? 1.8 : 1),
+  );
+}
+
+/**
+ * Near-certainty gate support test: true if any raw member (°C, converted to
+ * the event unit) lies within one KDE bandwidth of [lo, hi). KDE tail mass is
+ * not support. Empty members → no support.
+ */
+export function membersNearBucket(
+  membersC: number[],
+  lo: number,
+  hi: number,
+  unit: TempUnit,
+  eventDate: string,
+  tz?: string,
+  now = new Date(),
+) {
+  if (!membersC.length) return false;
+  const converted = membersC.map((c) => convertTemp(c, unit));
+  const h = kdeBandwidth(converted, unit, eventDate, tz, now);
+  const nearLo = Number.isFinite(lo) ? lo - h : -Infinity;
+  const nearHi = Number.isFinite(hi) ? hi + h : Infinity;
+  return converted.some((m) => m >= nearLo && m <= nearHi);
+}
+
+/** Representative temperature of a bucket (open ends: 0.5° inside the finite edge). */
+export function bucketMid(lo: number, hi: number) {
+  if (Number.isFinite(lo) && Number.isFinite(hi)) return (lo + hi) / 2;
+  if (Number.isFinite(lo)) return lo + 0.5;
+  if (Number.isFinite(hi)) return hi - 0.5;
+  return 0;
+}
+
+/** NO needs the bucket this far (event unit) from the model mean and the observation. */
+export function noGapMin(unit: TempUnit) {
+  return unit === "F" ? 9 : 5;
+}
+
+/** Live day: YES bucket may sit at most this far past the observed extreme (event unit). */
+export function yesLeadMax(unit: TempUnit) {
+  return unit === "F" ? 4.5 : 2.5;
+}
+
+/** Half-open [lo, hi), same as the settlement-rounded bucket bounds. */
+export function valueInBucket(v: number, lo: number, hi: number) {
+  if (!Number.isFinite(v)) return false;
+  const aboveLo = !Number.isFinite(lo) || v >= lo - 1e-6;
+  const belowHi = !Number.isFinite(hi) || v < hi;
+  return aboveLo && belowHi;
+}
+
+/**
+ * Condition members on the observed extreme so far today: the final daily max
+ * is ≥ the observed max (high), the final daily min is ≤ the observed min (low).
+ */
+export function adjustMembersForObserved(members: number[], observedC: number | null, kind: TempKind = "high") {
   if (observedC == null) return members;
-  return members.map((m) => Math.max(m, observedC));
+  return kind === "low" ? members.map((m) => Math.min(m, observedC)) : members.map((m) => Math.max(m, observedC));
 }
 
 export function bucketProbability(
@@ -80,19 +141,30 @@ export function bucketProbability(
   observedC: number | null,
   tz?: string,
   now = new Date(),
+  kind: TempKind = "high",
 ) {
-  const adjusted = adjustMembersForObserved(membersC, observedC);
+  const adjusted = adjustMembersForObserved(membersC, observedC, kind);
   if (!adjusted.length) return 0;
   const converted = adjusted.map((c) => convertTemp(c, unit));
-  const bandwidth = Math.max(stdev(converted) * 0.45, unit === "F" ? 1.1 : 0.65, leadSigmaC(eventDate, now, tz) * (unit === "F" ? 1.8 : 1));
+  const bandwidth = kdeBandwidth(converted, unit, eventDate, tz, now);
   let mass = kdeMass(converted, lo, hi, bandwidth);
   if (observedC != null) {
     const obs = convertTemp(observedC, unit);
-    if (Number.isFinite(hi) && hi <= obs + 1e-6) return 0;
-    if (Number.isFinite(lo) && lo < obs) {
-      const remaining = kdeMass(converted, obs, Infinity, bandwidth);
-      const piece = kdeMass(converted, Math.max(lo, obs), hi, bandwidth);
-      mass = remaining > 1e-9 ? piece / remaining : 0;
+    if (kind === "low") {
+      // Final min ≤ obs: buckets wholly above it are dead; renormalize on (-∞, obs].
+      if (Number.isFinite(lo) && lo > obs + 1e-6) return 0;
+      if (!Number.isFinite(hi) || hi > obs) {
+        const remaining = kdeMass(converted, -Infinity, obs, bandwidth);
+        const piece = kdeMass(converted, lo, Math.min(hi, obs), bandwidth);
+        mass = remaining > 1e-9 ? piece / remaining : 0;
+      }
+    } else {
+      if (Number.isFinite(hi) && hi <= obs + 1e-6) return 0;
+      if (Number.isFinite(lo) && lo < obs) {
+        const remaining = kdeMass(converted, obs, Infinity, bandwidth);
+        const piece = kdeMass(converted, Math.max(lo, obs), hi, bandwidth);
+        mass = remaining > 1e-9 ? piece / remaining : 0;
+      }
     }
   }
   return clamp01(mass);

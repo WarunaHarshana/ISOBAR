@@ -1,10 +1,15 @@
+import { convertTemp } from "../utils";
+import { membersNearBucket, valueInBucket } from "./math";
 import type { Signal, TempUnit } from "./types";
 
 /** Predictioner v1 — paper-only plausibility gate (fail closed upstream). */
 export type PlausibilityCtx = {
   members?: number[];
+  /** Observed extreme so far today (max for high, min for low), °C; null off the live day. */
   observedC?: number | null;
   now?: Date;
+  /** City tz (lead-time width for the member-support test). */
+  tz?: string;
   /** Optional bucket bounds in signal.unit (inclusive lo, exclusive hi when finite). */
   lo?: number;
   hi?: number;
@@ -88,6 +93,8 @@ function membersInBucket(members: number[], bucket: { lo: number; hi: number; un
  * 2) impossible vs season/climatology
  * 3) obs already past bucket
  * 4) modelP≈0 with no members in bucket
+ * 5) YES with no raw member near the bucket (near-certainty gate)
+ * 6) NO on a member-supported bucket, or the bucket the observation sits in
  *
  * Never mutates signal.modelP.
  */
@@ -135,6 +142,22 @@ export function plausibilityVeto(signal: Signal, ctx: PlausibilityCtx = {}): Pla
     }
   }
 
+  // 3b) Low markets mirror: the final min is ≤ the observed min, so a bucket wholly above it is dead.
+  if (
+    signal.side === "YES" &&
+    signal.kind === "low" &&
+    ctx.observedC != null &&
+    Number.isFinite(ctx.observedC)
+  ) {
+    const bucket = resolveBucket(signal, ctx);
+    if (bucket) {
+      const obsInUnit = bucket.unit === "F" ? (ctx.observedC! * 9) / 5 + 32 : ctx.observedC!;
+      if (Number.isFinite(bucket.lo) && obsInUnit < bucket.lo - 1e-6) {
+        return { ok: false, reason: "obs already below bucket" };
+      }
+    }
+  }
+
   // 4) modelP≈0 with no members in bucket — veto with reason; do NOT set modelP=0
   if (
     ctx.members != null &&
@@ -145,6 +168,28 @@ export function plausibilityVeto(signal: Signal, ctx: PlausibilityCtx = {}): Pla
     const bucket = resolveBucket(signal, ctx);
     if (bucket && membersInBucket(ctx.members, bucket) === 0) {
       return { ok: false, reason: "modelP≈0 no members in bucket" };
+    }
+  }
+
+  // 5) YES with no ensemble member near the bucket (KDE tail is not support).
+  // Only with explicit bucket bounds from the snapshot — never inferred from the label.
+  const hasLo = ctx.lo != null && Number.isFinite(ctx.lo);
+  const hasHi = ctx.hi != null && Number.isFinite(ctx.hi);
+  if ((hasLo || hasHi) && ctx.members != null && ctx.members.length >= MIN_MEMBERS) {
+    const unit = signal.unit ?? "C";
+    const lo = hasLo ? ctx.lo! : -Infinity;
+    const hi = hasHi ? ctx.hi! : Infinity;
+    const supported = membersNearBucket(ctx.members, lo, hi, unit, signal.date, ctx.tz, ctx.now);
+    if (signal.side === "YES" && !supported) return { ok: false, reason: "no ensemble support near bucket" };
+    // 6) NO must not short a bucket the ensemble supports.
+    if (signal.side === "NO" && supported) return { ok: false, reason: "NO shorts ensemble-supported bucket" };
+  }
+  // 6b) …nor the bucket the live observed extreme already sits in.
+  if (signal.side === "NO" && (hasLo || hasHi) && ctx.observedC != null && Number.isFinite(ctx.observedC)) {
+    const unit = signal.unit ?? "C";
+    const obsU = convertTemp(ctx.observedC, unit);
+    if (valueInBucket(obsU, hasLo ? ctx.lo! : -Infinity, hasHi ? ctx.hi! : Infinity)) {
+      return { ok: false, reason: "obs already in bucket" };
     }
   }
 

@@ -1,5 +1,5 @@
 import { getWorkerStatus, startPaperWorker } from "../../src/lib/desk/paper-worker";
-import { loadPaperBook } from "../../src/lib/desk/paper-book";
+import { availableCash, cityLedger, fillTickets, loadPaperBook, realizedPnl } from "../../src/lib/desk/paper-book";
 
 /**
  * Railway healthcheck. Plain default export — Nitro v3 in this stack does not
@@ -18,7 +18,15 @@ export default function healthHandler() {
       openFills: worker.openFills,
       liveLocked: worker.liveLocked,
       ticks: worker.ticks,
+      lastError: worker.lastError,
+      filledLastTick: worker.filledLastTick,
+      cash: worker.cash,
     },
     openFills: book.fills.filter((f) => f.status === "open").length,
+    fills: book.fills.length,
+    cash: availableCash(book),
+    pnl: realizedPnl(book.fills),
+    cities: cityLedger(book.fills),
+    tickets: fillTickets(book.fills),
   };
 }

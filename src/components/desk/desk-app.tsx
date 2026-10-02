@@ -28,7 +28,6 @@ import {
   resetPaperBookFn,
 } from "@/lib/desk/paper-api";
 import { useDeskStore } from "@/lib/desk/store";
-import { cityLedger } from "./city-ledger";
 import { weatherLabel } from "@/lib/desk/parse";
 import type { BotSettings, DeskEvent, DeskSnapshot, MarketBucket, Signal, WeatherNow } from "@/lib/desk/types";
 import { cn, convertTemp, formatPct, formatTemp, formatUsd } from "@/lib/utils";
@@ -476,17 +475,10 @@ function Board({
 
         <div className="relative mt-6 grid grid-cols-2 gap-3 sm:grid-cols-4">
           <Metric icon={Thermometer} label="Now" value={formatTemp(nowTemp, unit)} />
-          <Metric icon={Activity} label="Model high" value={event.modelHigh != null ? `${event.modelHigh.toFixed(1)}°${unit}` : "—"} />
+          <Metric icon={Activity} label={event.kind === "low" ? "Model low" : "Model high"} value={event.modelHigh != null ? `${event.modelHigh.toFixed(1)}°${unit}` : "—"} />
           <Metric icon={Crosshair} label="Implied" value={event.implied != null ? `${event.implied.toFixed(1)}°${unit}` : "—"} />
-          <Metric icon={CloudSun} label="Observed max" value={event.observed != null ? `${event.observed.toFixed(1)}°${unit}` : "—"} />
+          <Metric icon={CloudSun} label={event.kind === "low" ? "Observed min" : "Observed max"} value={event.observed != null ? `${event.observed.toFixed(1)}°${unit}` : "—"} />
         </div>
-
-        {event.kind === "low" ? (
-          <p className="relative mt-3 text-[11px] text-white/45">
-            Low-temp market: display only. The forecast ensemble is daily-max, so no low-market edges are priced and
-            the observed max does not apply.
-          </p>
-        ) : null}
 
         <div className="relative mt-5 flex flex-wrap items-center gap-2.5 text-xs text-white/60">
           <div className="inline-flex items-center gap-1.5 rounded-full bg-white/[0.05] border border-white/[0.08] px-3 py-1">
@@ -804,7 +796,7 @@ function ActivityConsole({
 }) {
   const paper = usePaperBookQuery();
   const fills = paper.data?.book.fills ?? [];
-  const rows = useMemo(() => cityLedger(paper.data?.book.fills ?? []), [paper.data?.book.fills]);
+  const rows = paper.data?.cities ?? [];
   const [tab, setTab] = useState<"edges" | "fills" | "ledger">("edges");
 
   return (
@@ -965,7 +957,7 @@ function SignalsList({
 
 function CityLedgerCard({ isExpanded = false }: { isExpanded?: boolean }) {
   const paper = usePaperBookQuery();
-  const rows = useMemo(() => cityLedger(paper.data?.book.fills ?? []), [paper.data?.book.fills]);
+  const rows = paper.data?.cities ?? [];
   return (
     <div className={cn("rounded-3xl glass-card overflow-hidden select-none flex flex-col shadow-glass", isExpanded ? "h-[560px]" : "h-[500px]")}>
       <div className="flex items-center justify-between px-5 py-3.5 border-b border-white/[0.08] bg-white/[0.02]">

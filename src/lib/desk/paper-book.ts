@@ -20,6 +20,7 @@ export type PaperTradeOpts = {
   members?: number[];
   observedC?: number | null;
   now?: Date;
+  tz?: string;
   lo?: number;
   hi?: number;
 };
@@ -27,13 +28,20 @@ export type PaperTradeOpts = {
 /** Quant freeze — keep worker + UI floors identical. */
 export const PAPER_MIN_EDGE = 0.06;
 export const PAPER_MIN_PRICE = 0.05;
+/** Member-supported (modal-bucket) YES may print cheaper than NO. */
+export const PAPER_MIN_PRICE_YES = 0.03;
+/** Skip NO when the crowd already has YES ≥ this (cheap shorts of 80%+ favorites). */
+export const PAPER_NO_MAX_YES = 0.8;
+/** YES only on the modal bucket and only when its modelP is at least this. */
+export const PAPER_YES_MIN_MODELP = 0.2;
 export const PAPER_MAX_PRICE = 0.85;
 export const PAPER_KELLY = 0.12;
 export const PAPER_MAX_POS = 0.08;
 export const PAPER_MAX_FILLS_PER_TICK = 4;
 export const PAPER_MAX_OPEN = 8;
 export const PAPER_MAX_OPEN_PER_EVENT = 1;
-export const PAPER_MAX_OPEN_PER_CITY_DATE = 2;
+/** One ticket per city-date (no YES+NO hedges or two YESes on one city). */
+export const PAPER_MAX_OPEN_PER_CITY_DATE = 1;
 export const PAPER_MIN_STAKE = 5;
 export const PAPER_LOG_LIMIT = 80;
 
@@ -174,6 +182,89 @@ export function realizedPnl(fills: PaperFill[]) {
   return { closed, openCost };
 }
 
+/** Mark-to-model PnL: open = shares × modelP − cost; settled = payout − cost. */
+export function fillMarkPnl(fill: PaperFill): number {
+  if (fill.status === "open") return fill.shares * fill.modelP - fill.cost;
+  return fill.payout - fill.cost;
+}
+
+export type CityLedgerRow = {
+  cityId: string;
+  cityName: string;
+  open: number;
+  won: number;
+  lost: number;
+  yes: number;
+  no: number;
+  cost: number;
+  openCost: number;
+  closedPnl: number;
+  markPnl: number;
+};
+
+/** Per-city paper ledger, ranked by closed PnL first, then mark-to-model. */
+export function cityLedger(fills: PaperFill[]): CityLedgerRow[] {
+  const byId = new Map<string, CityLedgerRow>();
+  for (const f of fills) {
+    const key = f.cityId || f.cityName || "unknown";
+    let row = byId.get(key);
+    if (!row) {
+      row = {
+        cityId: f.cityId || key,
+        cityName: f.cityName || f.cityId || key,
+        open: 0,
+        won: 0,
+        lost: 0,
+        yes: 0,
+        no: 0,
+        cost: 0,
+        openCost: 0,
+        closedPnl: 0,
+        markPnl: 0,
+      };
+      byId.set(key, row);
+    }
+    row.cost += f.cost;
+    row.markPnl += fillMarkPnl(f);
+    if (f.side === "YES") row.yes += 1;
+    else row.no += 1;
+    if (f.status === "open") {
+      row.open += 1;
+      row.openCost += f.cost;
+    } else {
+      if (f.status === "won") row.won += 1;
+      else row.lost += 1;
+      row.closedPnl += f.payout - f.cost;
+    }
+  }
+  return [...byId.values()].sort((a, b) => b.closedPnl - a.closedPnl || b.markPnl - a.markPnl);
+}
+
+export type FillTicket = {
+  city: string;
+  side: PaperFill["side"];
+  date: string;
+  question: string;
+  status: PaperFill["status"];
+  price: number;
+  cost: number;
+  pnl: number;
+};
+
+/** Compact per-fill tickets for /health (mark-to-model PnL). */
+export function fillTickets(fills: PaperFill[]): FillTicket[] {
+  return fills.map((f) => ({
+    city: f.cityName,
+    side: f.side,
+    date: f.date,
+    question: f.question,
+    status: f.status,
+    price: f.price,
+    cost: f.cost,
+    pnl: fillMarkPnl(f),
+  }));
+}
+
 /** Cash available for new risk: bankroll + closed PnL − open cost. */
 export function availableCash(current: PaperBook = loadPaperBook()) {
   const { closed, openCost } = realizedPnl(current.fills);
@@ -282,7 +373,8 @@ export function paperTrade(
     price = conservativeFillPrice(signal.side, signal.marketP, opts.bestBid, opts.bestAsk);
   }
 
-  if (price < PAPER_MIN_PRICE || price > PAPER_MAX_PRICE) return null;
+  const minPx = signal.side === "YES" ? PAPER_MIN_PRICE_YES : PAPER_MIN_PRICE;
+  if (price < minPx || price > PAPER_MAX_PRICE) return null;
 
   // Predictioner gate — after fill price, before Kelly. Fail closed.
   const plausCtx: PlausibilityCtx = {};
@@ -290,6 +382,7 @@ export function paperTrade(
     if (opts.members != null) plausCtx.members = opts.members;
     if (opts.observedC !== undefined) plausCtx.observedC = opts.observedC;
     if (opts.now != null) plausCtx.now = opts.now;
+    if (opts.tz != null) plausCtx.tz = opts.tz;
     if (opts.lo != null) plausCtx.lo = opts.lo;
     if (opts.hi != null) plausCtx.hi = opts.hi;
   }

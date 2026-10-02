@@ -156,15 +156,15 @@ describe("caps", () => {
     assert.equal(paperTrade(signal({ marketId: "n", eventId: "n", cityId: "n" }), { ...emptyBook(), fills }), null);
     assert.equal(paperTrade(signal({ eventId: "ev1", marketId: "m2" }), { ...emptyBook(), fills: [openFill()] }), null);
     assert.equal(PAPER_MAX_OPEN_PER_EVENT, 1);
-    assert.equal(PAPER_MAX_OPEN_PER_CITY_DATE, 2);
-    const two = {
+    assert.equal(PAPER_MAX_OPEN_PER_CITY_DATE, 1);
+    const one = {
       ...emptyBook(),
-      fills: [
-        openFill({ id: "a", marketId: "a", eventId: "eA", cityId: "nyc", date: "2026-09-04" }),
-        openFill({ id: "b", marketId: "b", eventId: "eB", cityId: "nyc", date: "2026-09-04" }),
-      ],
+      fills: [openFill({ id: "a", marketId: "a", eventId: "eA", cityId: "nyc", date: "2026-09-04" })],
     };
-    assert.equal(paperTrade(signal({ marketId: "c", eventId: "eC" }), two), null);
+    // One ticket per city-date: a second market on the same city/date is refused…
+    assert.equal(paperTrade(signal({ marketId: "c", eventId: "eC" }), one), null);
+    // …but another date for the same city is fine.
+    assert.ok(paperTrade(signal({ marketId: "d", eventId: "eD", date: "2026-09-05" }), one));
   });
 });
 
